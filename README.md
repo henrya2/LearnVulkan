@@ -46,7 +46,7 @@ cargo run
 | `LShift` | Move down |
 | Mouse | Look around |
 | Left click | Lock & hide cursor |
-| `Ctrl` + `Z` | Release cursor lock |
+| `Alt` + `Z` | Release cursor lock |
 | `Alt`+`Tab` / focus loss | Auto-release cursor lock |
 
 ## Project Structure

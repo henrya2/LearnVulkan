@@ -6,7 +6,7 @@ pub struct InputState {
     pub up: bool,
     pub down: bool,
     pub mouse_delta: (f64, f64),
-    pub ctrl_down: bool,
+    pub alt_down: bool,
 }
 
 impl InputState {
@@ -19,7 +19,7 @@ impl InputState {
             up: false,
             down: false,
             mouse_delta: (0.0, 0.0),
-            ctrl_down: false,
+            alt_down: false,
         }
     }
 

@@ -48,7 +48,7 @@ Per-frame flow:
 
 Mouse lock:
 - Left click while unlocked -> `CursorGrabMode::Locked` with `Confined` fallback, hide cursor
-- `Ctrl+Z` -> release lock, show cursor
+- `Alt+Z` -> release lock, show cursor
 - Focus loss -> auto-release lock
 
 ### Camera (`src/camera.rs`)

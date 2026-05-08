@@ -6,7 +6,7 @@ Final artifact also written to docs/vulkan_fps_plan.md during implementation.
 - Replace triangle with a unit colored cube (per-face colors) at origin.
 - Large flat ground plane at y = 0.
 - Free-fly FPS camera: mouse look (pitch/yaw), WASD, Space/LShift up/down.
-- Left click grabs and hides cursor. Ctrl+Z releases. Initial state: unlocked.
+- Left click grabs and hides cursor. Alt+Z releases. Initial state: unlocked.
 
 ## 2. Coordinate System and Math (critical)
 
@@ -185,7 +185,7 @@ Methods:
 ### 4.11 Mouse-lock details
 - Left click press -> try `CursorGrabMode::Locked`; on `ExternalError::NotSupported` -> `Confined`. Hide cursor.
 - Initial: unlocked, cursor visible, no grab at startup.
-- Ctrl+Z (LCtrl held + Z pressed) -> release grab + show cursor.
+- Alt+Z (LAlt held + Z pressed) -> release grab + show cursor.
 - `DeviceEvent::MouseMotion` is the look-delta source regardless of grab mode.
 - On `Focused(false)` -> auto-release so Alt-Tab does not trap the cursor.
 
@@ -200,7 +200,7 @@ Aspect per-frame from swapchain extent. Depth image recreated inside `recreate_s
 5. `camera.rs`; plumb `view_proj` through `App::update -> Renderer::draw_frame`
 6. Floor mesh + second draw call.
 7. `input.rs` + keyboard + `DeviceEvent::MouseMotion` + per-frame update.
-8. Cursor lock (click to lock, Ctrl+Z to release, focus-loss auto-release).
+8. Cursor lock (click to lock, Alt+Z to release, focus-loss auto-release).
 9. Polish.
 
 Every step leaves a runnable program (modulo step 3 caveat above).
@@ -215,7 +215,7 @@ Every step leaves a runnable program (modulo step 3 caveat above).
 - W moves the camera toward `forward` (toward what the camera is *aimed at* in world space, regardless of how it appears on screen).
 - Pitch clamps at +/-89 degrees; no gimbal inversion.
 - Resize preserves aspect.
-- Click locks+hides cursor; Ctrl+Z releases+shows.
+- Click locks+hides cursor; Alt+Z releases+shows.
 - Initial launch: cursor visible and free.
 - Mouse-X changes yaw (turns left/right), mouse-Y changes pitch (looks up/down).
 

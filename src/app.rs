@@ -78,9 +78,9 @@ impl App {
             PhysicalKey::Code(KeyCode::KeyD) => self.input.right = pressed,
             PhysicalKey::Code(KeyCode::Space) => self.input.up = pressed,
             PhysicalKey::Code(KeyCode::ShiftLeft) => self.input.down = pressed,
-            PhysicalKey::Code(KeyCode::ControlLeft) => self.input.ctrl_down = pressed,
+            PhysicalKey::Code(KeyCode::AltLeft) => self.input.alt_down = pressed,
             PhysicalKey::Code(KeyCode::KeyZ) => {
-                if pressed && self.input.ctrl_down && self.mouse_locked {
+                if pressed && self.input.alt_down && self.mouse_locked {
                     self.set_mouse_lock(false);
                 }
             }
