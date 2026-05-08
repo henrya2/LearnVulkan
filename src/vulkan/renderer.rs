@@ -1,15 +1,20 @@
 use glam::Mat4;
 
 use crate::mesh;
-use crate::vulkan::buffer::{GpuBuffer, create_device_local_buffer};
+use crate::vulkan::buffer::{GpuBuffer, create_buffer, create_device_local_buffer};
 use crate::vulkan::context::VulkanContext;
+use crate::vulkan::descriptors::{
+    create_descriptor_pool, create_descriptor_set_layout, create_descriptor_sets,
+};
 use crate::vulkan::pipeline::{PipelineData, create_pipeline, create_render_pass};
 use crate::vulkan::swapchain::{
     SwapchainData, cleanup_swapchain, create_swapchain, find_depth_format,
 };
+use crate::vulkan::texture::Texture;
 use ash::vk;
 
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
+const UBO_SIZE: vk::DeviceSize = 64; // one mat4
 
 pub struct Renderer {
     pub device: ash::Device,
@@ -29,6 +34,12 @@ pub struct Renderer {
     pub floor_vb: GpuBuffer,
     pub floor_ib: GpuBuffer,
     pub floor_index_count: u32,
+    pub texture: Texture,
+    pub descriptor_set_layout: vk::DescriptorSetLayout,
+    pub descriptor_pool: vk::DescriptorPool,
+    pub descriptor_sets: Vec<vk::DescriptorSet>,
+    pub uniform_buffers: Vec<GpuBuffer>,
+    pub uniform_mapped: Vec<*mut u8>,
 }
 
 impl Renderer {
@@ -50,7 +61,13 @@ impl Renderer {
             render_pass,
         );
 
-        let pipeline = create_pipeline(&ctx.device, render_pass, swapchain.extent);
+        let descriptor_set_layout = create_descriptor_set_layout(&ctx.device);
+        let pipeline = create_pipeline(
+            &ctx.device,
+            render_pass,
+            swapchain.extent,
+            descriptor_set_layout,
+        );
 
         let command_pool = {
             let create_info = vk::CommandPoolCreateInfo::default()
@@ -60,7 +77,7 @@ impl Renderer {
         };
 
         let (cube_verts, cube_indices) = mesh::cube(1.0);
-        let (floor_verts, floor_indices) = mesh::floor(20.0, 0.0, [0.3, 0.3, 0.35]);
+        let (floor_verts, floor_indices) = mesh::floor(20.0, 0.0, 10.0);
 
         let cube_vb = create_device_local_buffer(
             ctx,
@@ -85,6 +102,38 @@ impl Renderer {
             command_pool,
             &floor_indices,
             vk::BufferUsageFlags::INDEX_BUFFER,
+        );
+
+        let texture = Texture::from_png(ctx, command_pool, "assets/texture.png");
+
+        // Per-frame UBOs, persistently mapped.
+        let mut uniform_buffers = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
+        let mut uniform_mapped: Vec<*mut u8> = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
+        for _ in 0..MAX_FRAMES_IN_FLIGHT {
+            let buf = create_buffer(
+                &ctx.device,
+                UBO_SIZE,
+                vk::BufferUsageFlags::UNIFORM_BUFFER,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                &ctx.instance,
+                ctx.physical_device,
+            );
+            let ptr = unsafe {
+                ctx.device
+                    .map_memory(buf.memory, 0, UBO_SIZE, vk::MemoryMapFlags::empty())
+                    .unwrap()
+            } as *mut u8;
+            uniform_buffers.push(buf);
+            uniform_mapped.push(ptr);
+        }
+
+        let descriptor_pool = create_descriptor_pool(&ctx.device, MAX_FRAMES_IN_FLIGHT as u32);
+        let descriptor_sets = create_descriptor_sets(
+            &ctx.device,
+            descriptor_set_layout,
+            descriptor_pool,
+            &uniform_buffers,
+            &texture,
         );
 
         let command_buffers = {
@@ -143,6 +192,12 @@ impl Renderer {
             floor_vb,
             floor_ib,
             floor_index_count: floor_indices.len() as u32,
+            texture,
+            descriptor_set_layout,
+            descriptor_pool,
+            descriptor_sets,
+            uniform_buffers,
+            uniform_mapped,
         }
     }
 
@@ -200,6 +255,17 @@ impl Renderer {
                 .unwrap();
         }
 
+        // Write the per-frame UBO. The fence wait above guarantees this frame's
+        // prior GPU work has finished, so this memory isn't being read.
+        let mvp_cols = view_proj.to_cols_array();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                mvp_cols.as_ptr() as *const u8,
+                self.uniform_mapped[frame],
+                UBO_SIZE as usize,
+            );
+        }
+
         let extent = self.swapchain.extent;
         let framebuffer = self.swapchain.framebuffers[image_index as usize];
 
@@ -211,7 +277,7 @@ impl Renderer {
             extent,
             self.pipeline.pipeline,
             self.pipeline.pipeline_layout,
-            view_proj,
+            self.descriptor_sets[frame],
             &self.cube_vb,
             &self.cube_ib,
             self.cube_index_count,
@@ -308,6 +374,21 @@ impl Drop for Renderer {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
+
+            // Texture (sampler, view, image, memory).
+            self.texture.destroy(&self.device);
+
+            // Uniform buffers. memory free implicitly unmaps the persistent mapping.
+            for ub in &self.uniform_buffers {
+                ub.destroy(&self.device);
+            }
+
+            // Descriptor pool (frees sets implicitly), then layout.
+            self.device
+                .destroy_descriptor_pool(self.descriptor_pool, None);
+            self.device
+                .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
+
             self.cube_vb.destroy(&self.device);
             self.cube_ib.destroy(&self.device);
             self.floor_vb.destroy(&self.device);
@@ -342,7 +423,7 @@ fn record_command_buffer(
     extent: vk::Extent2D,
     pipeline: vk::Pipeline,
     pipeline_layout: vk::PipelineLayout,
-    view_proj: Mat4,
+    descriptor_set: vk::DescriptorSet,
     cube_vb: &GpuBuffer,
     cube_ib: &GpuBuffer,
     cube_index_count: u32,
@@ -402,17 +483,16 @@ fn record_command_buffer(
         device.cmd_set_scissor(command_buffer, 0, std::slice::from_ref(&scissor));
         device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
 
-        let mvp_cols = view_proj.to_cols_array();
-        let mvp_bytes = bytemuck::bytes_of(&mvp_cols);
+        device.cmd_bind_descriptor_sets(
+            command_buffer,
+            vk::PipelineBindPoint::GRAPHICS,
+            pipeline_layout,
+            0,
+            std::slice::from_ref(&descriptor_set),
+            &[],
+        );
 
         // Cube
-        device.cmd_push_constants(
-            command_buffer,
-            pipeline_layout,
-            vk::ShaderStageFlags::VERTEX,
-            0,
-            mvp_bytes,
-        );
         device.cmd_bind_vertex_buffers(
             command_buffer,
             0,
@@ -423,13 +503,6 @@ fn record_command_buffer(
         device.cmd_draw_indexed(command_buffer, cube_index_count, 1, 0, 0, 0);
 
         // Floor
-        device.cmd_push_constants(
-            command_buffer,
-            pipeline_layout,
-            vk::ShaderStageFlags::VERTEX,
-            0,
-            mvp_bytes,
-        );
         device.cmd_bind_vertex_buffers(
             command_buffer,
             0,

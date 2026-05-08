@@ -77,6 +77,7 @@ pub fn create_pipeline(
     device: &ash::Device,
     render_pass: vk::RenderPass,
     extent: vk::Extent2D,
+    descriptor_set_layout: vk::DescriptorSetLayout,
 ) -> PipelineData {
     let vert_code = include_bytes!("../../shaders/scene.vert.spv");
     let frag_code = include_bytes!("../../shaders/scene.frag.spv");
@@ -165,13 +166,8 @@ pub fn create_pipeline(
         .logic_op_enable(false)
         .attachments(std::slice::from_ref(&color_blend_attachment));
 
-    let push_constant_range = vk::PushConstantRange::default()
-        .stage_flags(vk::ShaderStageFlags::VERTEX)
-        .offset(0)
-        .size(64);
-
-    let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
-        .push_constant_ranges(std::slice::from_ref(&push_constant_range));
+    let set_layouts = [descriptor_set_layout];
+    let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts);
     let pipeline_layout = unsafe {
         device
             .create_pipeline_layout(&pipeline_layout_info, None)

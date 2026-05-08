@@ -4,7 +4,7 @@ use bytemuck::{Pod, Zeroable};
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct Vertex {
     pub pos: [f32; 3],
-    pub color: [f32; 3],
+    pub uv: [f32; 2],
 }
 
 impl Vertex {
@@ -25,12 +25,15 @@ impl Vertex {
             ash::vk::VertexInputAttributeDescription::default()
                 .binding(0)
                 .location(1)
-                .format(ash::vk::Format::R32G32B32_SFLOAT)
+                .format(ash::vk::Format::R32G32_SFLOAT)
                 .offset(12),
         ]
     }
 }
 
+// p0..p3 are the 4 corners of a quad in CCW-from-outside order.
+// Corner UVs: p0=(0,1), p1=(0,0), p2=(1,0), p3=(1,1)
+// so the texture appears upright (v=0 at top) from outside the face.
 fn face(
     verts: &mut Vec<Vertex>,
     idx: &mut Vec<u32>,
@@ -38,13 +41,24 @@ fn face(
     p1: [f32; 3],
     p2: [f32; 3],
     p3: [f32; 3],
-    color: [f32; 3],
 ) {
     let b = verts.len() as u32;
-    verts.push(Vertex { pos: p0, color });
-    verts.push(Vertex { pos: p1, color });
-    verts.push(Vertex { pos: p2, color });
-    verts.push(Vertex { pos: p3, color });
+    verts.push(Vertex {
+        pos: p0,
+        uv: [0.0, 1.0],
+    });
+    verts.push(Vertex {
+        pos: p1,
+        uv: [0.0, 0.0],
+    });
+    verts.push(Vertex {
+        pos: p2,
+        uv: [1.0, 0.0],
+    });
+    verts.push(Vertex {
+        pos: p3,
+        uv: [1.0, 1.0],
+    });
     idx.extend_from_slice(&[b + 0, b + 1, b + 2, b + 0, b + 2, b + 3]);
 
     // Sanity check: (p1-p0) x (p2-p0) with standard cross should point away from origin
@@ -64,7 +78,7 @@ pub fn cube(size: f32) -> (Vec<Vertex>, Vec<u32>) {
     let mut verts = Vec::with_capacity(24);
     let mut idx = Vec::with_capacity(36);
 
-    // +X face (right, red)
+    // +X face (right)
     face(
         &mut verts,
         &mut idx,
@@ -72,9 +86,8 @@ pub fn cube(size: f32) -> (Vec<Vertex>, Vec<u32>) {
         [h, h, -h],
         [h, h, h],
         [h, -h, h],
-        [1.0, 0.0, 0.0],
     );
-    // -X face (left, dark red)
+    // -X face (left)
     face(
         &mut verts,
         &mut idx,
@@ -82,9 +95,8 @@ pub fn cube(size: f32) -> (Vec<Vertex>, Vec<u32>) {
         [-h, h, h],
         [-h, h, -h],
         [-h, -h, -h],
-        [0.5, 0.0, 0.0],
     );
-    // +Y face (top, green)
+    // +Y face (top)
     face(
         &mut verts,
         &mut idx,
@@ -92,9 +104,8 @@ pub fn cube(size: f32) -> (Vec<Vertex>, Vec<u32>) {
         [-h, h, h],
         [h, h, h],
         [h, h, -h],
-        [0.0, 1.0, 0.0],
     );
-    // -Y face (bottom, dark green)
+    // -Y face (bottom)
     face(
         &mut verts,
         &mut idx,
@@ -102,9 +113,8 @@ pub fn cube(size: f32) -> (Vec<Vertex>, Vec<u32>) {
         [-h, -h, -h],
         [h, -h, -h],
         [h, -h, h],
-        [0.0, 0.5, 0.0],
     );
-    // +Z face (far, blue)
+    // +Z face (far)
     face(
         &mut verts,
         &mut idx,
@@ -112,9 +122,8 @@ pub fn cube(size: f32) -> (Vec<Vertex>, Vec<u32>) {
         [h, h, h],
         [-h, h, h],
         [-h, -h, h],
-        [0.0, 0.0, 1.0],
     );
-    // -Z face (near, dark blue)
+    // -Z face (near)
     face(
         &mut verts,
         &mut idx,
@@ -122,32 +131,32 @@ pub fn cube(size: f32) -> (Vec<Vertex>, Vec<u32>) {
         [-h, h, -h],
         [h, h, -h],
         [h, -h, -h],
-        [0.0, 0.0, 0.5],
     );
 
     (verts, idx)
 }
 
-pub fn floor(half: f32, y: f32, color: [f32; 3]) -> (Vec<Vertex>, Vec<u32>) {
+// `tile` is how many times the texture repeats across the full plane (each axis).
+pub fn floor(half: f32, y: f32, tile: f32) -> (Vec<Vertex>, Vec<u32>) {
     let mut verts = Vec::with_capacity(4);
     let mut idx = Vec::with_capacity(6);
 
     let b = verts.len() as u32;
     verts.push(Vertex {
         pos: [-half, y, -half],
-        color,
+        uv: [0.0, 0.0],
     });
     verts.push(Vertex {
         pos: [-half, y, half],
-        color,
+        uv: [0.0, tile],
     });
     verts.push(Vertex {
         pos: [half, y, half],
-        color,
+        uv: [tile, tile],
     });
     verts.push(Vertex {
         pos: [half, y, -half],
-        color,
+        uv: [tile, 0.0],
     });
     idx.extend_from_slice(&[b + 0, b + 1, b + 2, b + 0, b + 2, b + 3]);
 

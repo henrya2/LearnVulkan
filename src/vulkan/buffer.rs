@@ -18,7 +18,7 @@ impl GpuBuffer {
     }
 }
 
-fn find_memory_type(
+pub fn find_memory_type(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
     type_filter: u32,
@@ -37,7 +37,7 @@ fn find_memory_type(
     panic!("Failed to find suitable memory type")
 }
 
-fn create_buffer(
+pub fn create_buffer(
     device: &ash::Device,
     size: vk::DeviceSize,
     usage: vk::BufferUsageFlags,
@@ -110,6 +110,31 @@ pub fn create_device_local_buffer<T: Pod>(
         ctx.physical_device,
     );
 
+    with_one_time_command(ctx, command_pool, |cmd| unsafe {
+        let copy_region = vk::BufferCopy::default().size(size);
+        ctx.device.cmd_copy_buffer(
+            cmd,
+            staging.buffer,
+            target.buffer,
+            std::slice::from_ref(&copy_region),
+        );
+    });
+
+    unsafe {
+        staging.destroy(device);
+    }
+
+    target
+}
+
+/// Allocate a primary command buffer from `command_pool`, begin it with ONE_TIME_SUBMIT,
+/// run `record`, then submit to the graphics queue and wait for idle.
+pub fn with_one_time_command<F: FnOnce(vk::CommandBuffer)>(
+    ctx: &VulkanContext,
+    command_pool: vk::CommandPool,
+    record: F,
+) {
+    let device = &ctx.device;
     unsafe {
         let cmd = device
             .allocate_command_buffers(
@@ -128,13 +153,7 @@ pub fn create_device_local_buffer<T: Pod>(
             )
             .unwrap();
 
-        let copy_region = vk::BufferCopy::default().size(size);
-        device.cmd_copy_buffer(
-            cmd,
-            staging.buffer,
-            target.buffer,
-            std::slice::from_ref(&copy_region),
-        );
+        record(cmd);
 
         device.end_command_buffer(cmd).unwrap();
 
@@ -150,10 +169,4 @@ pub fn create_device_local_buffer<T: Pod>(
 
         device.free_command_buffers(command_pool, std::slice::from_ref(&cmd));
     }
-
-    unsafe {
-        staging.destroy(device);
-    }
-
-    target
 }
