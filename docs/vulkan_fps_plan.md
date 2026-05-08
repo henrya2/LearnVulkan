@@ -25,7 +25,7 @@ Forward from yaw/pitch — yaw measured around +Y (positive yaw turns from +Z to
 At yaw=0, pitch=0 this gives (0, 0, +1) — the LH "forward".
 At yaw=+90 deg, pitch=0 this gives (+1, 0, 0) — turn right.
 
-Right vector in LH: `right = Vec3::Y.cross(forward).normalize()`.
+Right vector in LH: the implementation uses `self.quat * Vec3::X` for consistency with the cached quaternion.
 - glam's `Vec3::cross` is the standard (RH) cross product. In an LH frame, the LH right-hand pair is `up x forward = right` numerically, which is exactly `Vec3::Y.cross(forward)` using the same numerical formula. (Equivalently: in RH, `right = forward x up`; flipping Z to LH negates one factor and one result, so `right = up x forward` in LH.) Verify at yaw=0: forward=(0,0,1), Y=(0,1,0), Y.cross(forward) = (1,0,0). Correct: right is +X.
 
 ### 2.3 Projection (Vulkan-friendly Z in [0, 1], no Y flip)
@@ -141,18 +141,19 @@ Impl: HOST_VISIBLE|HOST_COHERENT staging -> memcpy -> DEVICE_LOCAL target (`usag
 - Drop destroys the 4 `GpuBuffer`s before the command pool.
 
 ### 4.7 src/camera.rs (new)
-Fields: `position: Vec3`; `yaw, pitch: f32` (rad; pitch clamp +/- 89 deg); `fov_y: f32`; `move_speed: f32`; `mouse_sensitivity: f32`.
+Fields: `position: Vec3`; `yaw, pitch: f32` (rad; pitch clamp +/- 89 deg); `fov_y: f32`; `quat: Quat`; `move_speed: f32`; `mouse_sensitivity: f32`.
 
 Methods:
-- `forward()`: `quat * Vec3::Z` where `quat = Quat::from_euler(YXZ, yaw, pitch, 0)` — LH; yaw=pitch=0 -> (0,0,+1).
-- `right()`: `Vec3::Y.cross(self.forward()).normalize()` — LH right (see 2.2).
+- `calculate_quat(yaw, pitch)`: `Quat::from_euler(YXZ, yaw, pitch, 0)` — private helper; result is cached in `self.quat` after every rotation change.
+- `forward()`: `self.quat * Vec3::Z` where `quat = Quat::from_euler(YXZ, yaw, pitch, 0)` — LH; yaw=pitch=0 -> (0,0,+1).
+- `right()`: `self.quat * Vec3::X` — uses the cached quaternion for consistency.
 - `up()`: `self.forward().cross(self.right()).normalize()` — LH up. Verify at yaw=pitch=0: forward=(0,0,1), right=(1,0,0), forward.cross(right)=(0,1,0). Correct: up is +Y.
-- `view_matrix()`: `Mat4::look_to_lh(self.position, self.forward(), Vec3::Y)`.
+- `view_matrix()`: `Mat4::look_to_lh(self.position, self.forward(), self.up())`.
 - `projection_matrix(aspect)`: `Mat4::perspective_lh(fov_y, aspect, znear, zfar)`. **No Y flip** — see 2.3.
 - `view_projection(aspect)`: `projection_matrix(aspect) * view_matrix()`.
 - `apply_mouse_delta(dx, dy)`:
   - `self.yaw += dx * sensitivity` (mouse-right increases yaw, turns right)
-  - `self.pitch -= dy * sensitivity` (mouse-up decreases pitch, looks up)
+  - `self.pitch += dy * sensitivity` (winit provides negative `dy` for upward motion, so pitch decreases and the camera looks up)
   - pitch clamped to +/- 89 degrees
 
 Defaults: position (0, 1.6, -3) — sit slightly behind the origin in LH so the cube at the origin is in front of us (+Z forward means "behind" is -Z), yaw 0, pitch 0, fov_y 60 deg, move_speed 4.0, mouse_sensitivity 0.0025.

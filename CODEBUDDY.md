@@ -54,11 +54,13 @@ Mouse lock:
 ### Camera (`src/camera.rs`)
 
 Left-handed, Y-up FPS camera.
-- `forward()` = `Quat::from_euler(YXZ, yaw, pitch, 0) * Vec3::Z`
-- `right()` = `Vec3::Y.cross(forward).normalize()` (LH right vector)
-- `view_matrix()` = `Mat4::look_to_lh(position, forward, Vec3::Y)`
+- `calculate_quat(yaw, pitch)` = `Quat::from_euler(YXZ, yaw, pitch, 0)` — cached in the `quat` field after every rotation change.
+- `forward()` = `self.quat * Vec3::Z`
+- `right()` = `self.quat * Vec3::X`
+- `up()` = `self.forward().cross(self.right()).normalize()`
+- `view_matrix()` = `Mat4::look_to_lh(position, forward, self.up())`
 - `projection_matrix(aspect)` = `Mat4::perspective_lh(fov_y, aspect, 0.1, 100.0)` — no Y flip
-- `apply_mouse_delta(dx, dy)`: `yaw += dx * sens`, `pitch -= dy * sens` (mouse-right turns right, mouse-up looks up)
+- `apply_mouse_delta(dx, dy)`: `yaw += dx * sens`, `pitch += dy * sens` (winit provides negative `dy` for upward motion, so pitch decreases and the camera looks up)
 - Pitch clamped to +/- 89 degrees
 
 Default position: `(0, 1.6, -3)` looking toward +Z.
