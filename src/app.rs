@@ -1,0 +1,168 @@
+use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use std::mem::ManuallyDrop;
+use std::sync::Arc;
+use std::time::Instant;
+use winit::dpi::PhysicalSize;
+use winit::event::{ElementState, KeyEvent, MouseButton};
+use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::window::{CursorGrabMode, Window};
+
+use crate::camera::Camera;
+use crate::input::InputState;
+use crate::vulkan::context::VulkanContext;
+use crate::vulkan::renderer::Renderer;
+
+pub struct App {
+    pub window: Arc<Window>,
+    pub ctx: ManuallyDrop<VulkanContext>,
+    pub renderer: ManuallyDrop<Renderer>,
+    pub camera: Camera,
+    pub input: InputState,
+    pub mouse_locked: bool,
+    pub last_frame: Instant,
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        unsafe {
+            ManuallyDrop::drop(&mut self.renderer);
+            ManuallyDrop::drop(&mut self.ctx);
+        }
+    }
+}
+
+impl App {
+    pub fn new(window: Window) -> Self {
+        let window = Arc::new(window);
+
+        let display = window.display_handle().unwrap();
+        let win_handle = window.window_handle().unwrap();
+
+        let ctx = VulkanContext::new(display, win_handle);
+
+        let size = window.inner_size();
+        let renderer = Renderer::new(&ctx, size.width, size.height);
+
+        Self {
+            window,
+            ctx: ManuallyDrop::new(ctx),
+            renderer: ManuallyDrop::new(renderer),
+            camera: Camera::new(),
+            input: InputState::new(),
+            mouse_locked: false,
+            last_frame: Instant::now(),
+        }
+    }
+
+    pub fn on_resize(&mut self, size: PhysicalSize<u32>) {
+        if size.width > 0 && size.height > 0 {
+            self.renderer.framebuffer_resized = true;
+        }
+    }
+
+    pub fn draw_frame(&mut self) {
+        let vp = self.update();
+        self.renderer.draw_frame(&self.ctx, vp);
+    }
+
+    pub fn window(&self) -> &Window {
+        &self.window
+    }
+
+    pub fn on_keyboard(&mut self, event: &KeyEvent) {
+        let pressed = event.state == ElementState::Pressed;
+        match event.physical_key {
+            PhysicalKey::Code(KeyCode::KeyW) => self.input.forward = pressed,
+            PhysicalKey::Code(KeyCode::KeyS) => self.input.back = pressed,
+            PhysicalKey::Code(KeyCode::KeyA) => self.input.left = pressed,
+            PhysicalKey::Code(KeyCode::KeyD) => self.input.right = pressed,
+            PhysicalKey::Code(KeyCode::Space) => self.input.up = pressed,
+            PhysicalKey::Code(KeyCode::ShiftLeft) => self.input.down = pressed,
+            PhysicalKey::Code(KeyCode::ControlLeft) => self.input.ctrl_down = pressed,
+            PhysicalKey::Code(KeyCode::KeyZ) => {
+                if pressed && self.input.ctrl_down && self.mouse_locked {
+                    self.set_mouse_lock(false);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn on_mouse_button(&mut self, button: MouseButton, state: ElementState) {
+        if button == MouseButton::Left && state == ElementState::Pressed && !self.mouse_locked {
+            self.set_mouse_lock(true);
+        }
+    }
+
+    pub fn on_device_mouse_motion(&mut self, dx: f64, dy: f64) {
+        if self.mouse_locked {
+            self.input.mouse_delta.0 += dx;
+            self.input.mouse_delta.1 += dy;
+        }
+    }
+
+    pub fn on_focus_lost(&mut self) {
+        if self.mouse_locked {
+            self.set_mouse_lock(false);
+        }
+    }
+
+    fn set_mouse_lock(&mut self, locked: bool) {
+        self.mouse_locked = locked;
+        if locked {
+            let mode = self
+                .window
+                .set_cursor_grab(CursorGrabMode::Locked)
+                .or_else(|_| self.window.set_cursor_grab(CursorGrabMode::Confined));
+            if mode.is_err() {
+                let _ = self.window.set_cursor_grab(CursorGrabMode::Confined);
+            }
+            self.window.set_cursor_visible(false);
+        } else {
+            let _ = self.window.set_cursor_grab(CursorGrabMode::None);
+            self.window.set_cursor_visible(true);
+        }
+    }
+
+    fn update(&mut self) -> glam::Mat4 {
+        let now = Instant::now();
+        let dt = (now - self.last_frame).as_secs_f32();
+        self.last_frame = now;
+
+        let (dx, dy) = self.input.drain_mouse_delta();
+        self.camera.apply_mouse_delta(dx, dy);
+
+        let forward = self.camera.forward();
+        let right = self.camera.right();
+        let mut move_dir = glam::Vec3::ZERO;
+        if self.input.forward {
+            move_dir += forward;
+        }
+        if self.input.back {
+            move_dir -= forward;
+        }
+        if self.input.right {
+            move_dir += right;
+        }
+        if self.input.left {
+            move_dir -= right;
+        }
+        if self.input.up {
+            move_dir += glam::Vec3::Y;
+        }
+        if self.input.down {
+            move_dir -= glam::Vec3::Y;
+        }
+        if move_dir != glam::Vec3::ZERO {
+            self.camera.position += move_dir.normalize() * self.camera.move_speed * dt;
+        }
+
+        let size = self.window.inner_size();
+        let aspect = if size.height > 0 {
+            size.width as f32 / size.height as f32
+        } else {
+            1.0
+        };
+        self.camera.view_projection(aspect)
+    }
+}
