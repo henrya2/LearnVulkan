@@ -13,6 +13,7 @@ pub struct SwapchainData {
     pub depth_image: vk::Image,
     pub depth_memory: vk::DeviceMemory,
     pub depth_view: vk::ImageView,
+    #[allow(dead_code)]
     pub depth_format: vk::Format,
 }
 
