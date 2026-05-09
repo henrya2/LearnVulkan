@@ -5,7 +5,7 @@
 1. Replace the colored cube with a textured cube (single 2D texture sampled in the fragment shader). The floor keeps sampling the same texture (tiled), so one pipeline serves both.
 2. Move the MVP matrix from a push constant to a uniform buffer (one UBO per in-flight frame, bound via descriptor set).
 
-Non-goals: mipmaps, anisotropy, per-object model matrices, multiple materials.
+Non-goals: anisotropy, per-object model matrices, multiple materials.
 
 ## 2. Design
 
@@ -28,7 +28,34 @@ Floor UVs: tile. With `half=20.0`, use UVs in 0..10 so the texture repeats 10x. 
 - Format: `R8G8B8A8_SRGB` (matches the sRGB swapchain color).
 - Source: 256x256 procedural checkerboard generated in code by default; `Texture::from_png` also provided (adds `image` crate). Keeps the repo runnable without an external asset.
 - Upload: mirror the staging pattern in `src/vulkan/buffer.rs:113-152`. Staging buffer -> `vk::Image` via `cmd_copy_buffer_to_image`, with two `cmd_pipeline_barrier` calls: `UNDEFINED -> TRANSFER_DST_OPTIMAL` then `TRANSFER_DST_OPTIMAL -> SHADER_READ_ONLY_OPTIMAL`.
-- One mip level. Linear min/mag. `REPEAT` addressing. No anisotropy.
+- Full mip chain generated at runtime via GPU blit (see §2.2.1). Linear min/mag/mipmap. `REPEAT` addressing. No anisotropy.
+
+#### 2.2.1 Mipmap Generation
+
+Mipmaps are generated at texture upload time inside the same one-time command buffer that copies the base-level pixels from the staging buffer. No CPU-side downsampling or offline mip baking is required.
+
+**Compute `mip_levels`:** `floor(log2(max(width, height))) + 1`. For a 256×256 texture this yields 9 levels (256→128→64→32→16→8→4→2→1).
+
+**Image usage flags:** `TRANSFER_DST | TRANSFER_SRC | SAMPLED`. `TRANSFER_SRC` is required because each mip level (except the last) is read as a blit source after being written.
+
+**Blit format support check:** Before creating the image, the code asserts that `R8G8B8A8_SRGB` supports both `BLIT_SRC` and `BLIT_DST` in optimal tiling (via `get_physical_device_format_properties`). If the device does not support this, the application panics with a clear message.
+
+**Command buffer sequence:**
+
+1. `cmd_pipeline_barrier`: all mip levels `UNDEFINED → TRANSFER_DST_OPTIMAL`.
+2. `cmd_copy_buffer_to_image`: staging buffer → mip level 0.
+3. For each level `i` in `1..mip_levels`:
+   - `cmd_pipeline_barrier`: level `i-1` `TRANSFER_DST_OPTIMAL → TRANSFER_SRC_OPTIMAL` (`src_access=TRANSFER_WRITE`, `dst_access=TRANSFER_READ`).
+   - `cmd_blit_image`: level `i-1` (source, `TRANSFER_SRC_OPTIMAL`) → level `i` (dest, `TRANSFER_DST_OPTIMAL`), `vk::Filter::LINEAR`, source/dest regions cover the full extent of each level (each dimension halved, minimum 1).
+4. Final `cmd_pipeline_barrier`: two sub-ranges transitioned to `SHADER_READ_ONLY_OPTIMAL`:
+   - Levels `0..mip_levels-1` from `TRANSFER_SRC_OPTIMAL` (`src_access=TRANSFER_READ`, `dst_access=SHADER_READ`).
+   - Level `mip_levels-1` from `TRANSFER_DST_OPTIMAL` (`src_access=TRANSFER_WRITE`, `dst_access=SHADER_READ`).
+
+If `mip_levels == 1` (e.g., a 1×1 texture), the blit loop is skipped and only the final barrier transitions level 0 from `TRANSFER_DST_OPTIMAL` to `SHADER_READ_ONLY_OPTIMAL`.
+
+**Image view:** `subresource_range.level_count` is set to the computed `mip_levels` (not `1`).
+
+**Sampler:** `max_lod` is set to `(mip_levels - 1) as f32` (not `0.0`), so the GPU samples lower-resolution levels for distant fragments. `mipmap_mode` remains `LINEAR`, `min_lod` remains `0.0`, `mip_lod_bias` remains `0.0`.
 
 ### 2.3 Uniform buffer (per-frame)
 
@@ -76,7 +103,7 @@ Rerun `shaders/compile.bat` after editing.
 |---|---|
 | `Cargo.toml` | Add `image = { version = "0.25", default-features = false, features = ["png"] }`. |
 | `src/mesh.rs` | Replace `color` with `uv`; fix `attribute_descriptions` (R32G32_SFLOAT, offset 12); update `face()` to take UVs; drop `color` param on `floor()` and emit UVs 0..tile. |
-| `src/vulkan/texture.rs` (new) | `struct Texture { image, memory, view, sampler }`. `Texture::checkerboard(ctx, command_pool)`, `Texture::from_png(ctx, command_pool, path)`, `destroy(&self, device)`. |
+| `src/vulkan/texture.rs` (new) | `struct Texture { image, memory, view, sampler }`. `Texture::checkerboard(ctx, command_pool)`, `Texture::from_png(ctx, command_pool, path)`, `destroy(&self, device)`. Runtime mipmap generation via GPU blit chain. |
 | `src/vulkan/descriptors.rs` (new) | `create_descriptor_set_layout`, `create_descriptor_pool`, `create_descriptor_sets`. |
 | `src/vulkan/pipeline.rs` | `create_pipeline` takes `descriptor_set_layout`; replace `push_constant_ranges` with `set_layouts`. Drop the 64-B push-constant range (lines 168-174). |
 | `src/vulkan/renderer.rs` | Remove both `cmd_push_constants` calls (lines 409-415 cube, 426-432 floor). Add fields: `descriptor_set_layout`, `descriptor_pool`, `descriptor_sets`, `uniform_buffers: Vec<GpuBuffer>`, `uniform_mapped: Vec<*mut u8>`, `texture: Texture`. Before submit, memcpy `view_proj.to_cols_array()` into `uniform_mapped[frame]`. In `record_command_buffer`, after `cmd_bind_pipeline`, call `cmd_bind_descriptor_sets` once with `descriptor_sets[frame]`, then draw cube and floor. Extend `Drop` to destroy texture, UBOs, pool, layout before pipeline. |
