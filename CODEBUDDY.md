@@ -25,6 +25,9 @@ cargo build
 
 # Run
 cargo run
+
+# Run a release build with Vulkan validation layers enabled
+cargo run --release -- --validation
 ```
 
 `assets/models/DamagedHelmet/` must exist at runtime with the glTF model and its textures. The model is loaded at startup via `load_gltf`.
@@ -93,7 +96,7 @@ Procedural mesh helpers:
 
 ### Vulkan Modules (`src/vulkan/`)
 
-- **`context.rs`**: Creates instance, debug messenger (debug builds only), surface, physical device, logical device, and queues. Validation layer `VK_LAYER_KHRONOS_validation` is enabled in debug builds. `ash::Entry::load()` is used (not `linked()`).
+- **`context.rs`**: Creates instance, debug messenger, surface, physical device, logical device, queues, and the device-level debug marker loader. `VK_EXT_debug_utils` is enabled in all builds so RenderDoc markers work in release captures. Validation layer `VK_LAYER_KHRONOS_validation` is enabled by default in debug builds and can be enabled in non-debug builds with `--validation` or `--validate`. `ash::Entry::load()` is used (not `linked()`).
 - **`buffer.rs`**: `GpuBuffer` plus low-level helpers (`create_buffer`, `find_memory_type`) exposed for texture and UBO creation. Staging-to-device-local upload via `create_device_local_buffer`. `with_one_time_command(ctx, pool, record)` is the shared one-shot command-buffer helper used by both buffer and image uploads.
 - **`swapchain.rs`**: Swapchain creation, image views, depth image/view/memory, and framebuffers. Uses `MAILBOX` if available, else `FIFO`. Extent is clamped to surface capabilities. Depth format is probed with fallback chain: D32_SFLOAT -> D24_UNORM_S8_UINT -> D32_SFLOAT_S8_UINT.
 - **`texture.rs`**: `Texture { image, memory, view, sampler }`. `Texture::from_png(ctx, pool, path)` decodes a PNG to RGBA8 and uploads as sRGB. `from_rgba8(ctx, pool, pixels, w, h)` is the sRGB convenience path; `from_rgba8_with_format(ctx, pool, pixels, w, h, format)` is the explicit-format path used by glTF semantic uploads. **Runtime mipmap generation**: `mip_levels = floor(log2(max(w, h))) + 1`. Image usage includes `TRANSFER_SRC` (in addition to `TRANSFER_DST | SAMPLED`) so each mip level can be blit-read. A blit format support check asserts the chosen format supports `BLIT_SRC | BLIT_DST` in optimal tiling. Inside the same one-time command buffer: after `cmd_copy_buffer_to_image` for level 0, a loop blits each level `i` from level `i-1` with `vk::Filter::LINEAR`, separated by `TRANSFER_DST_OPTIMAL -> TRANSFER_SRC_OPTIMAL` barriers. A final two-sub-range barrier transitions source levels from `TRANSFER_SRC_OPTIMAL` and the last level from `TRANSFER_DST_OPTIMAL` to `SHADER_READ_ONLY_OPTIMAL`. If `mip_levels == 1`, the blit loop is skipped. Image view `level_count` is set to `mip_levels`. Sampler `max_lod` is `(mip_levels - 1) as f32`, `mipmap_mode` is `LINEAR`, `REPEAT` addressing, no anisotropy.
@@ -107,7 +110,8 @@ Procedural mesh helpers:
   Both share: render pass (color + depth attachments), depth-stencil (`LESS`), `COUNTER_CLOCKWISE` front face, `BACK` cull mode. Viewport and scissor are dynamic state.
 - **`pbr_ubo.rs`**: `GlobalUniforms { view, proj, camera_pos, _pad0, light_dir, light_intensity }` (160 B) and `PushConstants { model, material_index, _pad }` (80 B), both bytemuck POD.
 - **`environment_map.rs`**: `create_synthetic_environment_map` generates a 256x128 RGBA8 gradient texture (warm studio-like soft gradient: brighter at top, darker at bottom) uploaded as `R8G8B8A8_UNORM` because it is sampled as lighting data. Used as a placeholder environment map for simplified IBL.
-- **`renderer.rs`**: Command pool/buffers, sync primitives, per-frame global UBOs, descriptor sets (global per-frame + per-material), scene, environment map, and `draw_frame`. Key design choices:
+- **`debug_marker.rs`**: Thin wrapper over `ash::ext::debug_utils::Device` for `VK_EXT_debug_utils`. Provides command-buffer labels and Vulkan object names for RenderDoc in all builds.
+- **`renderer.rs`**: Command pool/buffers, sync primitives, per-frame global UBOs, descriptor sets (global per-frame + per-material), scene, environment map, debug marker labels/object naming, and `draw_frame`. Key design choices:
   - `MAX_FRAMES_IN_FLIGHT = 2`
   - `image_available` semaphores are per-frame
   - `render_finished` semaphores are **per-swapchain-image** (not per-frame) to avoid semaphore reuse validation errors
@@ -117,6 +121,7 @@ Procedural mesh helpers:
   - Global descriptor set (set 0) bound once per command buffer; per-material descriptor set (set 1) bound per mesh draw call.
   - Push constants updated per mesh draw call with model matrix and material index.
   - Viewport is set dynamically with **negative height**: `y = height`, `height = -height` to preserve Y-up NDC orientation
+  - RenderDoc markers: command buffers are labeled as frame -> main PBR render pass -> per-mesh draw regions. Major resources are named, including swapchain objects, pipeline objects, descriptor objects, UBOs, mesh buffers, textures, sync primitives, and fallback textures.
 
 ## Important Patterns
 
@@ -129,4 +134,5 @@ Procedural mesh helpers:
 - **Per-draw data**: Push constants for model matrix + material index (80 B, within 128 B guaranteed minimum).
 - **Cleanup order matters**: `Renderer` must be fully dropped (destroying all device-level objects) before `VulkanContext` drops the device. This is enforced by `ManuallyDrop` in `App`. Inside `Renderer::drop`, scene (meshes, textures, material buffer, fallbacks) and environment map are destroyed first, then UBOs, then descriptor pool/layouts, then fences/semaphores, then command pool, then pipeline/layout/render pass, then swapchain.
 - **Assets**: `assets/models/DamagedHelmet/` is a runtime dependency containing the glTF model and its PBR textures (albedo, normal, metallic-roughness, AO, emissive).
-- **Debug builds**: validation layers are active and will print errors to stdout. A clean shutdown produces no validation errors.
+- **Debug markers**: RenderDoc labels and object names must work in every build configuration. Keep `VK_EXT_debug_utils` enabled independently of validation layers.
+- **Validation layers**: active by default in debug builds and enabled in non-debug builds with `--validation` or `--validate`. A clean shutdown produces no validation errors.

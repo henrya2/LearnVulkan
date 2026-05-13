@@ -1,5 +1,6 @@
 pub mod buffer;
 pub mod context;
+pub mod debug_marker;
 pub mod descriptors;
 pub mod environment_map;
 pub mod pbr_ubo;

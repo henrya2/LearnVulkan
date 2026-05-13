@@ -17,7 +17,8 @@ A Vulkan PBR renderer written in Rust. It loads and renders glTF 2.0 models (Dam
   - WASD movement
   - Space / LShift for vertical movement
   - Click-to-lock cursor behavior
-- **Clean Vulkan bring-up** with validation layers in debug builds (zero errors on startup, resize, shutdown)
+- **Clean Vulkan bring-up** with validation layers in debug builds, plus opt-in validation in non-debug builds with `--validation` / `--validate`
+- **RenderDoc-friendly debug markers** via `VK_EXT_debug_utils` in all builds: labeled frame/render-pass/mesh regions and named GPU resources
 
 ## Tech Stack
 
@@ -45,6 +46,9 @@ cd ..
 
 # Build & run
 cargo run
+
+# Run a release build with Vulkan validation layers enabled
+cargo run --release -- --validation
 ```
 
 ## Controls
@@ -75,6 +79,7 @@ LearnVulkan/
 │   ├── vulkan_fps_plan.md     # FPS camera + scene plan
 │   ├── textured_cube_plan.md  # Texturing + UBO refactor plan
 │   ├── glTF_rendering_plan.md # glTF PBR rendering plan
+│   ├── debug_marker_plan.md   # RenderDoc debug marker plan
 │   └── review/                # Code review notes
 ├── shaders/
 │   ├── scene.vert / .frag     # Legacy scene shaders (cube/floor)
@@ -95,11 +100,12 @@ LearnVulkan/
     │   └── scene_graph.rs     # SceneGraph + SceneNode, world transform DFS
     └── vulkan/
         ├── mod.rs
-        ├── context.rs         # Instance, device, queues, debug messenger
+        ├── context.rs         # Instance, device, queues, debug messenger, debug marker loader
         ├── buffer.rs          # GpuBuffer, staging upload, one-time command helper
         ├── swapchain.rs       # Swapchain, depth buffer, framebuffers
         ├── texture.rs         # RGBA8 upload with explicit format, runtime mipmap generation
         ├── descriptors.rs     # Global + material descriptor set layouts, pool
+        ├── debug_marker.rs    # VK_EXT_debug_utils labels/object names for RenderDoc
         ├── pipeline.rs        # Render pass, legacy + PBR graphics pipelines
         ├── renderer.rs        # Command buffers, sync, per-frame UBOs, draw_frame
         ├── pbr_ubo.rs         # GlobalUniforms + PushConstants structs
@@ -119,6 +125,8 @@ LearnVulkan/
 - **Shader output color:** `pbr.frag` applies ACES tone mapping and outputs linear color; the sRGB swapchain attachment performs final linear-to-sRGB encoding.
 - **Cleanup order:** `Renderer` is dropped before `VulkanContext` via `ManuallyDrop`. Inside the renderer, scene -> env map -> UBOs -> descriptor pool/layouts -> sync -> command pool -> pipeline/layout/render pass -> swapchain.
 - **Sync strategy:** `MAX_FRAMES_IN_FLIGHT = 2`. `render_finished` semaphores are per-swapchain-image to avoid reuse validation errors.
+- **RenderDoc debug markers:** `VK_EXT_debug_utils` is enabled in all builds. Command buffers contain frame/render-pass/per-mesh label regions, and major Vulkan objects are named for RenderDoc resource inspection.
+- **Validation layers:** `VK_LAYER_KHRONOS_validation` is enabled by default in debug builds. In non-debug builds, launch with `--validation` or `--validate` to enable it.
 
 ## License
 

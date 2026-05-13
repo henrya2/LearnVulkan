@@ -14,6 +14,7 @@ use app::App;
 
 struct AppHandler {
     app: Option<App>,
+    enable_validation: bool,
 }
 
 impl ApplicationHandler for AppHandler {
@@ -23,7 +24,7 @@ impl ApplicationHandler for AppHandler {
                 .with_title("LearnVulkan - FPS Camera")
                 .with_inner_size(winit::dpi::LogicalSize::new(800, 600));
             let window = event_loop.create_window(attrs).unwrap();
-            self.app = Some(App::new(window));
+            self.app = Some(App::new(window, self.enable_validation));
         }
     }
 
@@ -57,8 +58,15 @@ impl ApplicationHandler for AppHandler {
 }
 
 fn main() {
+    let enable_validation = std::env::args()
+        .any(|arg| arg == "--validation" || arg == "--validate")
+        || cfg!(debug_assertions);
+
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut handler = AppHandler { app: None };
+    let mut handler = AppHandler {
+        app: None,
+        enable_validation,
+    };
     event_loop.run_app(&mut handler).unwrap();
 }

@@ -3,6 +3,7 @@ use glam::{Mat4, Vec3};
 use crate::scene::gltf_loader::{Scene, load_gltf};
 use crate::vulkan::buffer::{GpuBuffer, create_buffer};
 use crate::vulkan::context::VulkanContext;
+use crate::vulkan::debug_marker::DebugMarker;
 use crate::vulkan::descriptors::{
     create_descriptor_pool, create_global_descriptor_set_layout,
     create_material_descriptor_set_layout,
@@ -16,6 +17,10 @@ use crate::vulkan::swapchain::{
 use ash::vk;
 
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
+const FRAME_LABEL_COLOR: [f32; 4] = [0.3, 0.3, 0.3, 1.0];
+const RENDER_PASS_LABEL_COLOR: [f32; 4] = [0.2, 0.8, 0.2, 1.0];
+const DRAW_LABEL_COLOR: [f32; 4] = [0.3, 0.5, 1.0, 1.0];
+const SETUP_LABEL_COLOR: [f32; 4] = [0.8, 0.7, 0.2, 1.0];
 
 pub struct Renderer {
     pub device: ash::Device,
@@ -259,7 +264,7 @@ impl Renderer {
 
         let images_in_flight = vec![None; swapchain.images.len()];
 
-        Self {
+        let renderer = Self {
             device: ctx.device.clone(),
             swapchain,
             pipeline,
@@ -280,6 +285,101 @@ impl Renderer {
             global_descriptor_sets,
             material_descriptor_sets,
             env_map,
+        };
+
+        renderer.name_debug_objects(ctx);
+        renderer
+    }
+
+    fn name_debug_objects(&self, ctx: &VulkanContext) {
+        let Some(dm) = ctx.debug_marker.as_ref() else {
+            return;
+        };
+
+        unsafe {
+            dm.set_object_name(self.pipeline.render_pass, "Main PBR Render Pass");
+            dm.set_object_name(self.pipeline.pipeline_layout, "PBR Pipeline Layout");
+            dm.set_object_name(self.pipeline.pipeline, "PBR Graphics Pipeline");
+            dm.set_object_name(self.command_pool, "Main Graphics Command Pool");
+            dm.set_object_name(
+                self.global_descriptor_set_layout,
+                "Global Descriptor Set Layout",
+            );
+            dm.set_object_name(
+                self.material_descriptor_set_layout,
+                "Material Descriptor Set Layout",
+            );
+            dm.set_object_name(self.descriptor_pool, "Renderer Descriptor Pool");
+
+            for (i, &cmd) in self.command_buffers.iter().enumerate() {
+                dm.set_object_name(cmd, &format!("Frame Command Buffer {}", i));
+            }
+            for (i, buffer) in self.global_uniforms.iter().enumerate() {
+                dm.set_object_name(buffer.buffer, &format!("Global Uniform Buffer Frame {}", i));
+                dm.set_object_name(buffer.memory, &format!("Global Uniform Memory Frame {}", i));
+            }
+            for (i, &set) in self.global_descriptor_sets.iter().enumerate() {
+                dm.set_object_name(set, &format!("Global Descriptor Set Frame {}", i));
+            }
+            for (i, &set) in self.material_descriptor_sets.iter().enumerate() {
+                dm.set_object_name(set, &format!("Material Descriptor Set {}", i));
+            }
+            for (i, &semaphore) in self.image_available.iter().enumerate() {
+                dm.set_object_name(semaphore, &format!("Image Available Semaphore Frame {}", i));
+            }
+            for (i, &semaphore) in self.render_finished.iter().enumerate() {
+                dm.set_object_name(
+                    semaphore,
+                    &format!("Render Finished Semaphore Swapchain Image {}", i),
+                );
+            }
+            for (i, &fence) in self.in_flight.iter().enumerate() {
+                dm.set_object_name(fence, &format!("In Flight Fence Frame {}", i));
+            }
+
+            dm.set_object_name(self.scene.material_buffer.buffer, "Material Uniform Buffer");
+            dm.set_object_name(self.scene.material_buffer.memory, "Material Uniform Memory");
+            for (i, mesh) in self.scene.meshes.iter().enumerate() {
+                dm.set_object_name(
+                    mesh.vertex_buffer.buffer,
+                    &format!("Mesh {} Vertex Buffer", i),
+                );
+                dm.set_object_name(
+                    mesh.index_buffer.buffer,
+                    &format!("Mesh {} Index Buffer", i),
+                );
+            }
+            for (i, texture) in self.scene.textures.iter().enumerate() {
+                name_texture(dm, texture, &format!("Scene Texture {}", i));
+            }
+            name_texture(
+                dm,
+                &self.scene.fallback_textures.white_srgb,
+                "Fallback White sRGB Texture",
+            );
+            name_texture(
+                dm,
+                &self.scene.fallback_textures.white_linear,
+                "Fallback White Linear Texture",
+            );
+            name_texture(
+                dm,
+                &self.scene.fallback_textures.black_srgb,
+                "Fallback Black sRGB Texture",
+            );
+            name_texture(
+                dm,
+                &self.scene.fallback_textures.normal_linear,
+                "Fallback Normal Linear Texture",
+            );
+            name_texture(
+                dm,
+                &self.scene.fallback_textures.metallic_roughness_linear,
+                "Fallback Metallic-Roughness Linear Texture",
+            );
+            name_texture(dm, &self.env_map, "Synthetic Environment Map");
+
+            name_swapchain_objects(dm, &self.swapchain);
         }
     }
 
@@ -359,7 +459,10 @@ impl Renderer {
 
         record_command_buffer(
             &ctx.device,
+            ctx.debug_marker.as_ref(),
             command_buffer,
+            frame,
+            image_index,
             self.pipeline.render_pass,
             framebuffer,
             extent,
@@ -450,6 +553,45 @@ impl Renderer {
 
         self.images_in_flight = vec![None; swapchain.images.len()];
         self.swapchain = swapchain;
+
+        if let Some(dm) = ctx.debug_marker.as_ref() {
+            unsafe {
+                name_swapchain_objects(dm, &self.swapchain);
+                for (i, &semaphore) in self.render_finished.iter().enumerate() {
+                    dm.set_object_name(
+                        semaphore,
+                        &format!("Render Finished Semaphore Swapchain Image {}", i),
+                    );
+                }
+            }
+        }
+    }
+}
+
+unsafe fn name_texture(dm: &DebugMarker, texture: &crate::vulkan::texture::Texture, name: &str) {
+    unsafe {
+        dm.set_object_name(texture.image, &format!("{} Image", name));
+        dm.set_object_name(texture.memory, &format!("{} Memory", name));
+        dm.set_object_name(texture.view, &format!("{} View", name));
+        dm.set_object_name(texture.sampler, &format!("{} Sampler", name));
+    }
+}
+
+unsafe fn name_swapchain_objects(dm: &DebugMarker, swapchain: &SwapchainData) {
+    unsafe {
+        dm.set_object_name(swapchain.swapchain, "Main Swapchain");
+        dm.set_object_name(swapchain.depth_image, "Swapchain Depth Image");
+        dm.set_object_name(swapchain.depth_memory, "Swapchain Depth Memory");
+        dm.set_object_name(swapchain.depth_view, "Swapchain Depth View");
+        for (i, &image) in swapchain.images.iter().enumerate() {
+            dm.set_object_name(image, &format!("Swapchain Image {}", i));
+        }
+        for (i, &view) in swapchain.image_views.iter().enumerate() {
+            dm.set_object_name(view, &format!("Swapchain Image View {}", i));
+        }
+        for (i, &framebuffer) in swapchain.framebuffers.iter().enumerate() {
+            dm.set_object_name(framebuffer, &format!("Swapchain Framebuffer {}", i));
+        }
     }
 }
 
@@ -500,7 +642,10 @@ impl Drop for Renderer {
 
 fn record_command_buffer(
     device: &ash::Device,
+    debug_marker: Option<&DebugMarker>,
     command_buffer: vk::CommandBuffer,
+    frame: usize,
+    image_index: u32,
     render_pass: vk::RenderPass,
     framebuffer: vk::Framebuffer,
     extent: vk::Extent2D,
@@ -515,6 +660,13 @@ fn record_command_buffer(
         device
             .begin_command_buffer(command_buffer, &begin_info)
             .unwrap();
+        if let Some(dm) = debug_marker {
+            dm.begin_label(
+                command_buffer,
+                &format!("Frame {} / Swapchain Image {}", frame, image_index),
+                FRAME_LABEL_COLOR,
+            );
+        }
     }
 
     let clear_values = [
@@ -553,15 +705,35 @@ fn record_command_buffer(
         .extent(extent);
 
     unsafe {
+        if let Some(dm) = debug_marker {
+            dm.begin_label(
+                command_buffer,
+                "Main PBR Render Pass",
+                RENDER_PASS_LABEL_COLOR,
+            );
+        }
         device.cmd_begin_render_pass(
             command_buffer,
             &render_pass_begin,
             vk::SubpassContents::INLINE,
         );
+        if let Some(dm) = debug_marker {
+            dm.insert_label(
+                command_buffer,
+                "Set Dynamic Viewport/Scissor",
+                SETUP_LABEL_COLOR,
+            );
+        }
         device.cmd_set_viewport(command_buffer, 0, std::slice::from_ref(&viewport));
         device.cmd_set_scissor(command_buffer, 0, std::slice::from_ref(&scissor));
+        if let Some(dm) = debug_marker {
+            dm.insert_label(command_buffer, "Bind PBR Pipeline", SETUP_LABEL_COLOR);
+        }
         device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
 
+        if let Some(dm) = debug_marker {
+            dm.insert_label(command_buffer, "Bind Global Descriptors", SETUP_LABEL_COLOR);
+        }
         device.cmd_bind_descriptor_sets(
             command_buffer,
             vk::PipelineBindPoint::GRAPHICS,
@@ -571,7 +743,18 @@ fn record_command_buffer(
             &[],
         );
 
-        for mesh in &scene.meshes {
+        for (mesh_index, mesh) in scene.meshes.iter().enumerate() {
+            if let Some(dm) = debug_marker {
+                dm.begin_label(
+                    command_buffer,
+                    &format!(
+                        "Draw Mesh {} | Material {} | {} indices",
+                        mesh_index, mesh.material_index, mesh.index_count
+                    ),
+                    DRAW_LABEL_COLOR,
+                );
+            }
+
             let pc = PushConstants {
                 model: mesh.world_matrix.to_cols_array(),
                 material_index: mesh.material_index as u32,
@@ -579,6 +762,13 @@ fn record_command_buffer(
             };
             let pc_bytes = bytemuck::bytes_of(&pc);
 
+            if let Some(dm) = debug_marker {
+                dm.insert_label(
+                    command_buffer,
+                    "Push Constants: model matrix + material index",
+                    SETUP_LABEL_COLOR,
+                );
+            }
             device.cmd_push_constants(
                 command_buffer,
                 pipeline_layout,
@@ -587,6 +777,13 @@ fn record_command_buffer(
                 pc_bytes,
             );
 
+            if let Some(dm) = debug_marker {
+                dm.insert_label(
+                    command_buffer,
+                    "Bind Material Descriptor Set",
+                    SETUP_LABEL_COLOR,
+                );
+            }
             device.cmd_bind_descriptor_sets(
                 command_buffer,
                 vk::PipelineBindPoint::GRAPHICS,
@@ -596,6 +793,13 @@ fn record_command_buffer(
                 &[],
             );
 
+            if let Some(dm) = debug_marker {
+                dm.insert_label(
+                    command_buffer,
+                    "Bind Vertex/Index Buffers",
+                    SETUP_LABEL_COLOR,
+                );
+            }
             device.cmd_bind_vertex_buffers(
                 command_buffer,
                 0,
@@ -609,9 +813,17 @@ fn record_command_buffer(
                 vk::IndexType::UINT32,
             );
             device.cmd_draw_indexed(command_buffer, mesh.index_count, 1, 0, 0, 0);
+
+            if let Some(dm) = debug_marker {
+                dm.end_label(command_buffer);
+            }
         }
 
         device.cmd_end_render_pass(command_buffer);
+        if let Some(dm) = debug_marker {
+            dm.end_label(command_buffer);
+            dm.end_label(command_buffer);
+        }
         device.end_command_buffer(command_buffer).unwrap();
     }
 }

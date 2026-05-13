@@ -1,3 +1,4 @@
+use crate::vulkan::debug_marker::DebugMarker;
 use ash::vk;
 use raw_window_handle::{DisplayHandle, WindowHandle};
 use std::ffi::{CStr, CString, c_char};
@@ -16,6 +17,7 @@ pub struct VulkanContext {
     #[allow(dead_code)]
     pub present_family: u32,
     pub debug_utils: Option<DebugUtils>,
+    pub debug_marker: Option<DebugMarker>,
 }
 
 pub struct DebugUtils {
@@ -24,11 +26,11 @@ pub struct DebugUtils {
 }
 
 impl VulkanContext {
-    pub fn new(display: DisplayHandle, window: WindowHandle) -> Self {
+    pub fn new(display: DisplayHandle, window: WindowHandle, enable_validation: bool) -> Self {
         let entry = unsafe { ash::Entry::load() }.unwrap();
-        let instance = create_instance(&entry, display);
+        let instance = create_instance(&entry, display, enable_validation);
 
-        let debug_utils = if cfg!(debug_assertions) {
+        let debug_utils = if enable_validation {
             Some(create_debug_utils(&entry, &instance))
         } else {
             None
@@ -46,6 +48,8 @@ impl VulkanContext {
         let (device, graphics_queue, present_queue) =
             create_logical_device(&instance, physical_device, graphics_family, present_family);
 
+        let debug_marker = Some(DebugMarker::new(&instance, &device));
+
         Self {
             entry,
             instance,
@@ -58,6 +62,7 @@ impl VulkanContext {
             graphics_family,
             present_family,
             debug_utils,
+            debug_marker,
         }
     }
 }
@@ -75,7 +80,11 @@ impl Drop for VulkanContext {
     }
 }
 
-fn create_instance(entry: &ash::Entry, display: DisplayHandle) -> ash::Instance {
+fn create_instance(
+    entry: &ash::Entry,
+    display: DisplayHandle,
+    enable_validation: bool,
+) -> ash::Instance {
     let app_name = CString::new("LearnVulkan").unwrap();
     let engine_name = CString::new("NoEngine").unwrap();
 
@@ -90,12 +99,10 @@ fn create_instance(entry: &ash::Entry, display: DisplayHandle) -> ash::Instance 
         .unwrap()
         .to_vec();
 
-    if cfg!(debug_assertions) {
-        extensions.push(ash::ext::debug_utils::NAME.as_ptr());
-    }
+    extensions.push(ash::ext::debug_utils::NAME.as_ptr());
 
     let mut layer_names = Vec::new();
-    if cfg!(debug_assertions) {
+    if enable_validation {
         layer_names.push(c"VK_LAYER_KHRONOS_validation".as_ptr() as *const c_char);
     }
 
