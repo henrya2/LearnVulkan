@@ -53,6 +53,10 @@ Primitives without materials no longer use material index 0 by accident. The loa
 
 The loader now uses `document.default_scene()` with scene 0 fallback. This prevents inactive scenes and unreachable nodes from being rendered accidentally.
 
+### Coordinate system and winding
+
+The RH-to-LH conversion (vertex Z-negate, tangent.w flip, transform conjugation by `diag(1,1,−1,1)`) and the negative-height viewport are both orientation-reversing transforms. Their effects cancel through the rasterizer's framebuffer-space front-face test (Vulkan 1.3 §28.4), so the pipeline correctly uses `FRONT_FACE_COUNTER_CLOCKWISE` with `CULL_MODE_BACK`. End-to-end derivation with spec citations: `docs/winding_orientation.md`.
+
 ### Shader math
 
 The shader now:

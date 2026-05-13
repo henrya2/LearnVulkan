@@ -50,7 +50,7 @@ glTF uses a **right-handed, Y-up** coordinate system. This project uses **left-h
   ```
 - Normal vectors: since the conversion is a reflection, normals must be transformed by the inverse-transpose of the LH matrix. Tangents (xyzw) have their xyz reflected similarly; the handedness bit `w` must be flipped (`w = -w`) because the reflection changes winding.
 
-**Winding order:** glTF specifies CCW front faces. After Z-negation, winding becomes CW in the LH world. However, because the negative viewport height preserves (does not reverse) winding through the full transform pipeline, the pipeline still uses `FRONT_FACE_COUNTER_CLOCKWISE`. The RH-to-LH conversion reverses the sense of front/back in the transform, so the net effect is correct culling with `COUNTER_CLOCKWISE` front face.
+**Winding order:** glTF specifies CCW front faces in RH space. The vertex Z-negation is an improper transform (det = −1) that flips winding to CW-from-outside in LH world space. The negative-height viewport applies a second improper transform (y-axis reflection) that flips winding again. Vulkan determines front/back from the signed area in framebuffer coordinates (Vulkan 1.3 §28.4), so the two flips cancel and final framebuffer winding is CCW — matching `FRONT_FACE_COUNTER_CLOCKWISE`. See `docs/winding_orientation.md` for the full derivation.
 
 ---
 
@@ -804,7 +804,7 @@ Add `jpeg` feature to `image` for glTF JPEG textures.
 ## 19. Summary of Key Design Decisions
 
 1. **glTF crate:** `gltf` with `import` feature for automatic buffer/image resolution.
-2. **Coordinate conversion:** Negate Z in positions and transforms; flip tangent.w; use `COUNTER_CLOCKWISE` front face (negative viewport height preserves winding, and the RH-to-LH transform accounts for the reversal).
+2. **Coordinate conversion:** Negate Z in positions and transforms; flip tangent.w; use `COUNTER_CLOCKWISE` front face. The vertex Z-negate and the negative-height viewport are both improper (orientation-reversing) transforms — they cancel, producing CCW winding in framebuffer space, where Vulkan evaluates the front-face test (Vulkan 1.3 §28.4). Full derivation: `docs/winding_orientation.md`.
 3. **Descriptor strategy:** Two sets — set 0 per-frame global UBO, set 1 per-material textures. No descriptor indexing required.
 4. **Per-draw data:** Push constants for model matrix + material index.
 5. **Material data:** Device-local uniform buffer with `GpuMaterial` array, indexed by push constant.
