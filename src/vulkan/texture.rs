@@ -26,7 +26,7 @@ impl Texture {
         Self::from_rgba8(ctx, command_pool, img.as_raw(), width, height)
     }
 
-    /// Create a texture from raw RGBA8 pixel data with the given dimensions.
+    /// Create an sRGB texture from raw RGBA8 pixel data with the given dimensions.
     pub fn from_rgba8(
         ctx: &VulkanContext,
         command_pool: vk::CommandPool,
@@ -34,21 +34,43 @@ impl Texture {
         width: u32,
         height: u32,
     ) -> Self {
+        Self::from_rgba8_with_format(
+            ctx,
+            command_pool,
+            pixels,
+            width,
+            height,
+            vk::Format::R8G8B8A8_SRGB,
+        )
+    }
+
+    /// Create a texture from raw RGBA8 pixel data with an explicit Vulkan format.
+    pub fn from_rgba8_with_format(
+        ctx: &VulkanContext,
+        command_pool: vk::CommandPool,
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        format: vk::Format,
+    ) -> Self {
         let device = &ctx.device;
         let size = (width as vk::DeviceSize) * (height as vk::DeviceSize) * 4;
         assert_eq!(pixels.len() as vk::DeviceSize, size);
 
         let mip_levels = (width.max(height) as f32).log2().floor() as u32 + 1;
 
-        // Verify that the device supports blitting with R8G8B8A8_SRGB.
         let format_props = unsafe {
             ctx.instance
-                .get_physical_device_format_properties(ctx.physical_device, vk::Format::R8G8B8A8_SRGB)
+                .get_physical_device_format_properties(ctx.physical_device, format)
         };
-        let required_blit_features = vk::FormatFeatureFlags::BLIT_SRC | vk::FormatFeatureFlags::BLIT_DST;
+        let required_blit_features =
+            vk::FormatFeatureFlags::BLIT_SRC | vk::FormatFeatureFlags::BLIT_DST;
         assert!(
-            format_props.optimal_tiling_features.contains(required_blit_features),
-            "R8G8B8A8_SRGB does not support BLIT_SRC + BLIT_DST on this device; cannot generate mipmaps via blit"
+            format_props
+                .optimal_tiling_features
+                .contains(required_blit_features),
+            "{:?} does not support BLIT_SRC + BLIT_DST on this device; cannot generate mipmaps via blit",
+            format
         );
 
         // Staging buffer with pixel data.
@@ -78,10 +100,14 @@ impl Texture {
             })
             .mip_levels(mip_levels)
             .array_layers(1)
-            .format(vk::Format::R8G8B8A8_SRGB)
+            .format(format)
             .tiling(vk::ImageTiling::OPTIMAL)
             .initial_layout(vk::ImageLayout::UNDEFINED)
-            .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::SAMPLED)
+            .usage(
+                vk::ImageUsageFlags::TRANSFER_DST
+                    | vk::ImageUsageFlags::TRANSFER_SRC
+                    | vk::ImageUsageFlags::SAMPLED,
+            )
             .samples(vk::SampleCountFlags::TYPE_1)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
         let image = unsafe { device.create_image(&image_info, None).unwrap() };
@@ -207,20 +233,14 @@ impl Texture {
                         base_array_layer: 0,
                         layer_count: 1,
                     })
-                    .src_offsets([
-                        vk::Offset3D { x: 0, y: 0, z: 0 },
-                        src_offset,
-                    ])
+                    .src_offsets([vk::Offset3D { x: 0, y: 0, z: 0 }, src_offset])
                     .dst_subresource(vk::ImageSubresourceLayers {
                         aspect_mask: vk::ImageAspectFlags::COLOR,
                         mip_level: i,
                         base_array_layer: 0,
                         layer_count: 1,
                     })
-                    .dst_offsets([
-                        vk::Offset3D { x: 0, y: 0, z: 0 },
-                        dst_offset,
-                    ]);
+                    .dst_offsets([vk::Offset3D { x: 0, y: 0, z: 0 }, dst_offset]);
 
                 ctx.device.cmd_blit_image(
                     cmd,
@@ -301,7 +321,7 @@ impl Texture {
         let view_info = vk::ImageViewCreateInfo::default()
             .image(image)
             .view_type(vk::ImageViewType::TYPE_2D)
-            .format(vk::Format::R8G8B8A8_SRGB)
+            .format(format)
             .subresource_range(vk::ImageSubresourceRange {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
                 base_mip_level: 0,

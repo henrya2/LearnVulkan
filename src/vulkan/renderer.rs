@@ -1,20 +1,21 @@
-use glam::Mat4;
+use glam::{Mat4, Vec3};
 
-use crate::mesh;
-use crate::vulkan::buffer::{GpuBuffer, create_buffer, create_device_local_buffer};
+use crate::scene::gltf_loader::{Scene, load_gltf};
+use crate::vulkan::buffer::{GpuBuffer, create_buffer};
 use crate::vulkan::context::VulkanContext;
 use crate::vulkan::descriptors::{
-    create_descriptor_pool, create_descriptor_set_layout, create_descriptor_sets,
+    create_descriptor_pool, create_global_descriptor_set_layout,
+    create_material_descriptor_set_layout,
 };
-use crate::vulkan::pipeline::{PipelineData, create_pipeline, create_render_pass};
+use crate::vulkan::environment_map::create_synthetic_environment_map;
+use crate::vulkan::pbr_ubo::{GlobalUniforms, PushConstants};
+use crate::vulkan::pipeline::{PipelineData, create_pbr_pipeline, create_render_pass};
 use crate::vulkan::swapchain::{
     SwapchainData, cleanup_swapchain, create_swapchain, find_depth_format,
 };
-use crate::vulkan::texture::Texture;
 use ash::vk;
 
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
-const UBO_SIZE: vk::DeviceSize = 64; // one mat4
 
 pub struct Renderer {
     pub device: ash::Device,
@@ -28,18 +29,15 @@ pub struct Renderer {
     pub images_in_flight: Vec<Option<vk::Fence>>,
     pub current_frame: usize,
     pub framebuffer_resized: bool,
-    pub cube_vb: GpuBuffer,
-    pub cube_ib: GpuBuffer,
-    pub cube_index_count: u32,
-    pub floor_vb: GpuBuffer,
-    pub floor_ib: GpuBuffer,
-    pub floor_index_count: u32,
-    pub texture: Texture,
-    pub descriptor_set_layout: vk::DescriptorSetLayout,
+    pub scene: Scene,
+    pub global_uniforms: Vec<GpuBuffer>,
+    pub global_mapped: Vec<*mut u8>,
+    pub global_descriptor_set_layout: vk::DescriptorSetLayout,
+    pub material_descriptor_set_layout: vk::DescriptorSetLayout,
     pub descriptor_pool: vk::DescriptorPool,
-    pub descriptor_sets: Vec<vk::DescriptorSet>,
-    pub uniform_buffers: Vec<GpuBuffer>,
-    pub uniform_mapped: Vec<*mut u8>,
+    pub global_descriptor_sets: Vec<vk::DescriptorSet>,
+    pub material_descriptor_sets: Vec<vk::DescriptorSet>,
+    pub env_map: crate::vulkan::texture::Texture,
 }
 
 impl Renderer {
@@ -61,14 +59,6 @@ impl Renderer {
             render_pass,
         );
 
-        let descriptor_set_layout = create_descriptor_set_layout(&ctx.device);
-        let pipeline = create_pipeline(
-            &ctx.device,
-            render_pass,
-            swapchain.extent,
-            descriptor_set_layout,
-        );
-
         let command_pool = {
             let create_info = vk::CommandPoolCreateInfo::default()
                 .queue_family_index(ctx.graphics_family)
@@ -76,43 +66,32 @@ impl Renderer {
             unsafe { ctx.device.create_command_pool(&create_info, None).unwrap() }
         };
 
-        let (cube_verts, cube_indices) = mesh::cube(1.0);
-        let (floor_verts, floor_indices) = mesh::floor(20.0, 0.0, 10.0);
-
-        let cube_vb = create_device_local_buffer(
+        let scene = load_gltf(
             ctx,
             command_pool,
-            &cube_verts,
-            vk::BufferUsageFlags::VERTEX_BUFFER,
-        );
-        let cube_ib = create_device_local_buffer(
-            ctx,
-            command_pool,
-            &cube_indices,
-            vk::BufferUsageFlags::INDEX_BUFFER,
-        );
-        let floor_vb = create_device_local_buffer(
-            ctx,
-            command_pool,
-            &floor_verts,
-            vk::BufferUsageFlags::VERTEX_BUFFER,
-        );
-        let floor_ib = create_device_local_buffer(
-            ctx,
-            command_pool,
-            &floor_indices,
-            vk::BufferUsageFlags::INDEX_BUFFER,
+            "assets/models/DamagedHelmet/DamagedHelmet.gltf",
         );
 
-        let texture = Texture::from_png(ctx, command_pool, "assets/texture.png");
+        let global_descriptor_set_layout = create_global_descriptor_set_layout(&ctx.device);
+        let material_descriptor_set_layout = create_material_descriptor_set_layout(&ctx.device);
 
-        // Per-frame UBOs, persistently mapped.
-        let mut uniform_buffers = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
-        let mut uniform_mapped: Vec<*mut u8> = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
+        let push_constant_size = std::mem::size_of::<PushConstants>() as u32;
+        let pipeline = create_pbr_pipeline(
+            &ctx.device,
+            render_pass,
+            swapchain.extent,
+            global_descriptor_set_layout,
+            material_descriptor_set_layout,
+            push_constant_size,
+        );
+
+        let ubo_size = std::mem::size_of::<GlobalUniforms>() as vk::DeviceSize;
+        let mut global_uniforms = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
+        let mut global_mapped = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
         for _ in 0..MAX_FRAMES_IN_FLIGHT {
             let buf = create_buffer(
                 &ctx.device,
-                UBO_SIZE,
+                ubo_size,
                 vk::BufferUsageFlags::UNIFORM_BUFFER,
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
                 &ctx.instance,
@@ -120,21 +99,128 @@ impl Renderer {
             );
             let ptr = unsafe {
                 ctx.device
-                    .map_memory(buf.memory, 0, UBO_SIZE, vk::MemoryMapFlags::empty())
+                    .map_memory(buf.memory, 0, ubo_size, vk::MemoryMapFlags::empty())
                     .unwrap()
             } as *mut u8;
-            uniform_buffers.push(buf);
-            uniform_mapped.push(ptr);
+            global_uniforms.push(buf);
+            global_mapped.push(ptr);
         }
 
-        let descriptor_pool = create_descriptor_pool(&ctx.device, MAX_FRAMES_IN_FLIGHT as u32);
-        let descriptor_sets = create_descriptor_sets(
-            &ctx.device,
-            descriptor_set_layout,
-            descriptor_pool,
-            &uniform_buffers,
-            &texture,
-        );
+        let descriptor_pool = create_descriptor_pool(&ctx.device, scene.materials.len() as u32);
+
+        let env_map = create_synthetic_environment_map(ctx, command_pool);
+
+        let global_descriptor_sets = {
+            let layouts = vec![global_descriptor_set_layout; MAX_FRAMES_IN_FLIGHT];
+            let alloc_info = vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(descriptor_pool)
+                .set_layouts(&layouts);
+            unsafe { ctx.device.allocate_descriptor_sets(&alloc_info).unwrap() }
+        };
+
+        for i in 0..MAX_FRAMES_IN_FLIGHT {
+            let global_buffer_info = vk::DescriptorBufferInfo::default()
+                .buffer(global_uniforms[i].buffer)
+                .offset(0)
+                .range(ubo_size);
+            let material_buffer_info = vk::DescriptorBufferInfo::default()
+                .buffer(scene.material_buffer.buffer)
+                .offset(0)
+                .range(scene.material_buffer.size);
+            let env_map_info = vk::DescriptorImageInfo::default()
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .image_view(env_map.view)
+                .sampler(env_map.sampler);
+
+            let writes = [
+                vk::WriteDescriptorSet::default()
+                    .dst_set(global_descriptor_sets[i])
+                    .dst_binding(0)
+                    .dst_array_element(0)
+                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                    .buffer_info(std::slice::from_ref(&global_buffer_info)),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(global_descriptor_sets[i])
+                    .dst_binding(1)
+                    .dst_array_element(0)
+                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                    .buffer_info(std::slice::from_ref(&material_buffer_info)),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(global_descriptor_sets[i])
+                    .dst_binding(2)
+                    .dst_array_element(0)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(std::slice::from_ref(&env_map_info)),
+            ];
+            unsafe { ctx.device.update_descriptor_sets(&writes, &[]) };
+        }
+
+        let material_descriptor_sets = {
+            let layouts = vec![material_descriptor_set_layout; scene.materials.len()];
+            let alloc_info = vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(descriptor_pool)
+                .set_layouts(&layouts);
+            unsafe { ctx.device.allocate_descriptor_sets(&alloc_info).unwrap() }
+        };
+
+        for (mat_idx, material) in scene.materials.iter().enumerate() {
+            let base_color = material
+                .base_color_texture
+                .and_then(|i| scene.textures.get(i))
+                .unwrap_or(&scene.fallback_textures.white_srgb);
+            let metallic_roughness = material
+                .metallic_roughness_texture
+                .and_then(|i| scene.textures.get(i))
+                .unwrap_or(&scene.fallback_textures.metallic_roughness_linear);
+            let normal = material
+                .normal_texture
+                .and_then(|i| scene.textures.get(i))
+                .unwrap_or(&scene.fallback_textures.normal_linear);
+            let occlusion = material
+                .occlusion_texture
+                .and_then(|i| scene.textures.get(i))
+                .unwrap_or(&scene.fallback_textures.white_linear);
+            let emissive = material
+                .emissive_texture
+                .and_then(|i| scene.textures.get(i))
+                .unwrap_or(&scene.fallback_textures.black_srgb);
+
+            let image_infos = [
+                vk::DescriptorImageInfo::default()
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .image_view(base_color.view)
+                    .sampler(base_color.sampler),
+                vk::DescriptorImageInfo::default()
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .image_view(metallic_roughness.view)
+                    .sampler(metallic_roughness.sampler),
+                vk::DescriptorImageInfo::default()
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .image_view(normal.view)
+                    .sampler(normal.sampler),
+                vk::DescriptorImageInfo::default()
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .image_view(occlusion.view)
+                    .sampler(occlusion.sampler),
+                vk::DescriptorImageInfo::default()
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .image_view(emissive.view)
+                    .sampler(emissive.sampler),
+            ];
+
+            let writes: Vec<_> = (0..5)
+                .map(|binding| {
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(material_descriptor_sets[mat_idx])
+                        .dst_binding(binding as u32)
+                        .dst_array_element(0)
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .image_info(std::slice::from_ref(&image_infos[binding]))
+                })
+                .collect();
+
+            unsafe { ctx.device.update_descriptor_sets(&writes, &[]) };
+        }
 
         let command_buffers = {
             let alloc_info = vk::CommandBufferAllocateInfo::default()
@@ -146,7 +232,6 @@ impl Renderer {
 
         let mut image_available = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
         let mut in_flight = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
-
         for _ in 0..MAX_FRAMES_IN_FLIGHT {
             image_available.push(unsafe {
                 ctx.device
@@ -186,22 +271,19 @@ impl Renderer {
             images_in_flight,
             current_frame: 0,
             framebuffer_resized: false,
-            cube_vb,
-            cube_ib,
-            cube_index_count: cube_indices.len() as u32,
-            floor_vb,
-            floor_ib,
-            floor_index_count: floor_indices.len() as u32,
-            texture,
-            descriptor_set_layout,
+            scene,
+            global_uniforms,
+            global_mapped,
+            global_descriptor_set_layout,
+            material_descriptor_set_layout,
             descriptor_pool,
-            descriptor_sets,
-            uniform_buffers,
-            uniform_mapped,
+            global_descriptor_sets,
+            material_descriptor_sets,
+            env_map,
         }
     }
 
-    pub fn draw_frame(&mut self, ctx: &VulkanContext, view_proj: Mat4) {
+    pub fn draw_frame(&mut self, ctx: &VulkanContext, view: Mat4, proj: Mat4, camera_pos: Vec3) {
         if self.framebuffer_resized {
             self.recreate_swapchain(ctx);
             self.framebuffer_resized = false;
@@ -255,14 +337,20 @@ impl Renderer {
                 .unwrap();
         }
 
-        // Write the per-frame UBO. The fence wait above guarantees this frame's
-        // prior GPU work has finished, so this memory isn't being read.
-        let mvp_cols = view_proj.to_cols_array();
+        let light_dir = glam::Vec3::new(-0.5, -1.0, 0.5).normalize();
+        let globals = GlobalUniforms {
+            view: view.to_cols_array(),
+            proj: proj.to_cols_array(),
+            camera_pos: [camera_pos.x, camera_pos.y, camera_pos.z],
+            _pad0: 0.0,
+            light_dir: [light_dir.x, light_dir.y, light_dir.z],
+            light_intensity: 4.0,
+        };
         unsafe {
             std::ptr::copy_nonoverlapping(
-                mvp_cols.as_ptr() as *const u8,
-                self.uniform_mapped[frame],
-                UBO_SIZE as usize,
+                bytemuck::bytes_of(&globals).as_ptr(),
+                self.global_mapped[frame],
+                std::mem::size_of::<GlobalUniforms>(),
             );
         }
 
@@ -277,13 +365,9 @@ impl Renderer {
             extent,
             self.pipeline.pipeline,
             self.pipeline.pipeline_layout,
-            self.descriptor_sets[frame],
-            &self.cube_vb,
-            &self.cube_ib,
-            self.cube_index_count,
-            &self.floor_vb,
-            &self.floor_ib,
-            self.floor_index_count,
+            self.global_descriptor_sets[frame],
+            &self.material_descriptor_sets,
+            &self.scene,
         );
 
         let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
@@ -335,7 +419,6 @@ impl Renderer {
 
         cleanup_swapchain(&ctx.device, &mut self.swapchain);
 
-        // Destroy old per-image render-finished semaphores and recreate.
         unsafe {
             for &s in &self.render_finished {
                 self.device.destroy_semaphore(s, None);
@@ -375,24 +458,21 @@ impl Drop for Renderer {
         unsafe {
             let _ = self.device.device_wait_idle();
 
-            // Texture (sampler, view, image, memory).
-            self.texture.destroy(&self.device);
+            self.scene.destroy(&self.device);
 
-            // Uniform buffers. memory free implicitly unmaps the persistent mapping.
-            for ub in &self.uniform_buffers {
+            self.env_map.destroy(&self.device);
+
+            for ub in &self.global_uniforms {
                 ub.destroy(&self.device);
             }
 
-            // Descriptor pool (frees sets implicitly), then layout.
             self.device
                 .destroy_descriptor_pool(self.descriptor_pool, None);
             self.device
-                .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
+                .destroy_descriptor_set_layout(self.global_descriptor_set_layout, None);
+            self.device
+                .destroy_descriptor_set_layout(self.material_descriptor_set_layout, None);
 
-            self.cube_vb.destroy(&self.device);
-            self.cube_ib.destroy(&self.device);
-            self.floor_vb.destroy(&self.device);
-            self.floor_ib.destroy(&self.device);
             self.in_flight
                 .iter()
                 .for_each(|&f| self.device.destroy_fence(f, None));
@@ -402,14 +482,17 @@ impl Drop for Renderer {
             self.render_finished
                 .iter()
                 .for_each(|&s| self.device.destroy_semaphore(s, None));
+
             self.device
                 .free_command_buffers(self.command_pool, &self.command_buffers);
             self.device.destroy_command_pool(self.command_pool, None);
+
             self.device.destroy_pipeline(self.pipeline.pipeline, None);
             self.device
                 .destroy_pipeline_layout(self.pipeline.pipeline_layout, None);
             self.device
                 .destroy_render_pass(self.pipeline.render_pass, None);
+
             cleanup_swapchain(&self.device, &mut self.swapchain);
         }
     }
@@ -423,13 +506,9 @@ fn record_command_buffer(
     extent: vk::Extent2D,
     pipeline: vk::Pipeline,
     pipeline_layout: vk::PipelineLayout,
-    descriptor_set: vk::DescriptorSet,
-    cube_vb: &GpuBuffer,
-    cube_ib: &GpuBuffer,
-    cube_index_count: u32,
-    floor_vb: &GpuBuffer,
-    floor_ib: &GpuBuffer,
-    floor_index_count: u32,
+    global_descriptor_set: vk::DescriptorSet,
+    material_descriptor_sets: &[vk::DescriptorSet],
+    scene: &Scene,
 ) {
     let begin_info = vk::CommandBufferBeginInfo::default();
     unsafe {
@@ -441,7 +520,7 @@ fn record_command_buffer(
     let clear_values = [
         vk::ClearValue {
             color: vk::ClearColorValue {
-                float32: [0.02, 0.02, 0.04, 1.0],
+                float32: [0.15, 0.15, 0.17, 1.0],
             },
         },
         vk::ClearValue {
@@ -488,29 +567,49 @@ fn record_command_buffer(
             vk::PipelineBindPoint::GRAPHICS,
             pipeline_layout,
             0,
-            std::slice::from_ref(&descriptor_set),
+            std::slice::from_ref(&global_descriptor_set),
             &[],
         );
 
-        // Cube
-        device.cmd_bind_vertex_buffers(
-            command_buffer,
-            0,
-            std::slice::from_ref(&cube_vb.buffer),
-            &[0],
-        );
-        device.cmd_bind_index_buffer(command_buffer, cube_ib.buffer, 0, vk::IndexType::UINT32);
-        device.cmd_draw_indexed(command_buffer, cube_index_count, 1, 0, 0, 0);
+        for mesh in &scene.meshes {
+            let pc = PushConstants {
+                model: mesh.world_matrix.to_cols_array(),
+                material_index: mesh.material_index as u32,
+                _pad: [0; 3],
+            };
+            let pc_bytes = bytemuck::bytes_of(&pc);
 
-        // Floor
-        device.cmd_bind_vertex_buffers(
-            command_buffer,
-            0,
-            std::slice::from_ref(&floor_vb.buffer),
-            &[0],
-        );
-        device.cmd_bind_index_buffer(command_buffer, floor_ib.buffer, 0, vk::IndexType::UINT32);
-        device.cmd_draw_indexed(command_buffer, floor_index_count, 1, 0, 0, 0);
+            device.cmd_push_constants(
+                command_buffer,
+                pipeline_layout,
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                0,
+                pc_bytes,
+            );
+
+            device.cmd_bind_descriptor_sets(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipeline_layout,
+                1,
+                std::slice::from_ref(&material_descriptor_sets[mesh.material_index]),
+                &[],
+            );
+
+            device.cmd_bind_vertex_buffers(
+                command_buffer,
+                0,
+                std::slice::from_ref(&mesh.vertex_buffer.buffer),
+                &[0],
+            );
+            device.cmd_bind_index_buffer(
+                command_buffer,
+                mesh.index_buffer.buffer,
+                0,
+                vk::IndexType::UINT32,
+            );
+            device.cmd_draw_indexed(command_buffer, mesh.index_count, 1, 0, 0, 0);
+        }
 
         device.cmd_end_render_pass(command_buffer);
         device.end_command_buffer(command_buffer).unwrap();

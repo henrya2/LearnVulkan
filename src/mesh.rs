@@ -31,6 +31,49 @@ impl Vertex {
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct PbrVertex {
+    pub pos: [f32; 3],
+    pub normal: [f32; 3],
+    pub tangent: [f32; 4],
+    pub uv0: [f32; 2],
+}
+
+impl PbrVertex {
+    pub fn binding_description() -> ash::vk::VertexInputBindingDescription {
+        ash::vk::VertexInputBindingDescription::default()
+            .binding(0)
+            .stride(std::mem::size_of::<PbrVertex>() as u32)
+            .input_rate(ash::vk::VertexInputRate::VERTEX)
+    }
+
+    pub fn attribute_descriptions() -> [ash::vk::VertexInputAttributeDescription; 4] {
+        [
+            ash::vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(0)
+                .format(ash::vk::Format::R32G32B32_SFLOAT)
+                .offset(0),
+            ash::vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(1)
+                .format(ash::vk::Format::R32G32B32_SFLOAT)
+                .offset(12),
+            ash::vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(2)
+                .format(ash::vk::Format::R32G32B32A32_SFLOAT)
+                .offset(24),
+            ash::vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(3)
+                .format(ash::vk::Format::R32G32_SFLOAT)
+                .offset(40),
+        ]
+    }
+}
+
 // p0..p3 are the 4 corners of a quad in CCW-from-outside order.
 // Corner UVs: p0=(0,1), p1=(0,0), p2=(1,0), p3=(1,1)
 // so the texture appears upright (v=0 at top) from outside the face.

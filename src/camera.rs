@@ -17,7 +17,7 @@ impl Camera {
 
     pub fn new() -> Self {
         let mut result = Self {
-            position: Vec3::new(0.0, 1.6, -3.0),
+            position: Vec3::new(0.0, 0.0, -3.0),
             yaw: 0.0,
             pitch: 0.0,
             quat: glam::Quat::IDENTITY,

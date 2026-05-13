@@ -1,6 +1,8 @@
 pub mod buffer;
 pub mod context;
 pub mod descriptors;
+pub mod environment_map;
+pub mod pbr_ubo;
 pub mod pipeline;
 pub mod renderer;
 pub mod swapchain;

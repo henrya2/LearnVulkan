@@ -7,6 +7,7 @@ mod app;
 mod camera;
 mod input;
 mod mesh;
+mod scene;
 mod vulkan;
 
 use app::App;

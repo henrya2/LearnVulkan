@@ -61,8 +61,8 @@ impl App {
     }
 
     pub fn draw_frame(&mut self) {
-        let vp = self.update();
-        self.renderer.draw_frame(&self.ctx, vp);
+        let (view, proj, camera_pos) = self.update();
+        self.renderer.draw_frame(&self.ctx, view, proj, camera_pos);
     }
 
     pub fn window(&self) -> &Window {
@@ -124,7 +124,7 @@ impl App {
         }
     }
 
-    fn update(&mut self) -> glam::Mat4 {
+    fn update(&mut self) -> (glam::Mat4, glam::Mat4, glam::Vec3) {
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
@@ -163,6 +163,10 @@ impl App {
         } else {
             1.0
         };
-        self.camera.view_projection(aspect)
+        (
+            self.camera.view_matrix(),
+            self.camera.projection_matrix(aspect),
+            self.camera.position,
+        )
     }
 }
