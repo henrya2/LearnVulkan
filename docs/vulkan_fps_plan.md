@@ -52,13 +52,13 @@ Trace the parity for an LH cube wound CCW-from-outside, using the actual matrice
 1. World: face vertices wind CCW as seen by an outside observer (LH world: `+X` right, `+Y` up, `+Z` forward).
 2. After `look_to_lh` (orientation-preserving — its top-3x3 has det = +1; verified by hand at the canonical `dir=(0,0,1), up=(0,1,0)` pose where it reduces to the identity): a face whose outward normal points toward the camera still winds CCW in view space.
 3. After `perspective_lh` (no Y flip applied): the X-Y NDC mapping is `(x, y) -> (w.x/z, h.y/z)` with `w, h, z > 0` for any visible vertex. Positive-scale 2D map -> orientation-preserving. Front faces remain **CCW in NDC**.
-4. Viewport transform (negative `height`): `y_f = (-p_y/2).y_d + (p_y + o_y)` is monotonic-decreasing; this reverses orientation. Front faces become **CW in framebuffer coords**.
+4. Viewport transform (negative `height`): `y_f = (-p_y/2).y_d + (p_y + o_y)` — this maps NDC Y-up to screen Y-up (preserving the orientation from NDC), so winding is **preserved**. Front faces remain **CCW in framebuffer coords**.
 
-Result: visible front faces have **CW winding** in framebuffer coordinates (due to the negative viewport height flip).
+Result: visible front faces have **CCW winding** in framebuffer coordinates (the negative viewport height preserves the Y-up orientation, so no winding reversal occurs).
 
 Pipeline state:
 
-    front_face = vk::FrontFace::CLOCKWISE
+    front_face = vk::FrontFace::COUNTER_CLOCKWISE
     cull_mode  = vk::CullModeFlags::BACK
 
 The negative viewport height is applied to match DirectX NDC orientation so the same MVP produces the same image across APIs.
@@ -121,7 +121,7 @@ Impl: HOST_VISIBLE|HOST_COHERENT staging -> memcpy -> DEVICE_LOCAL target (`usag
 - Vertex input uses `Vertex::binding_description` + `attribute_descriptions`.
 - Push constant range: stage VERTEX, offset 0, size 64.
 - Depth-stencil state: `depth_test_enable = true`, `depth_write_enable = true`, `compare_op = LESS` (we use `perspective_lh` with Z in [0,1] mapped znear->0, zfar->1, so nearer = smaller depth, LESS is correct).
-- Set `front_face = CLOCKWISE`, `cull_mode = BACK`. The negative viewport height (see 2.4) reverses framebuffer winding, so CLOCKWISE compensates.
+- Set `front_face = COUNTER_CLOCKWISE`, `cull_mode = BACK`. The negative viewport height preserves Y-up orientation from NDC to screen space, so CCW winding in NDC remains CCW in framebuffer coordinates.
 - `create_render_pass(depth_format)`: add depth attachment + `depth_stencil_attachment_ref`; extend subpass dependency with `EARLY_FRAGMENT_TESTS | LATE_FRAGMENT_TESTS` and `DEPTH_STENCIL_ATTACHMENT_WRITE`.
 - Viewport and scissor are set as dynamic state in the command buffer (not baked into the pipeline), with a negative viewport height to match DirectX NDC orientation.
 
@@ -242,4 +242,4 @@ Optional cleanup: delete `shaders/triangle.{vert,frag,vert.spv,frag.spv}`.
 - Depth format unsupported. Mitigation: probe + fallback list D32_SFLOAT -> D24_UNORM_S8_UINT -> D32_SFLOAT_S8_UINT.
 - Push constant >128 B. Mitigation: push exactly 64 B (one Mat4).
 - Leaked depth on swapchain recreate. Mitigation: update `cleanup_swapchain` first.
-- **Viewport flip and winding**: negative viewport height reverses framebuffer winding. `front_face` must be `CLOCKWISE` to compensate. Documented in 2.4 and pipeline comments.
+- **Viewport flip and winding**: negative viewport height preserves Y-up orientation from NDC to screen space, so winding is NOT reversed. `front_face` must be `COUNTER_CLOCKWISE` to match mesh winding. Documented in 2.4 and pipeline comments.

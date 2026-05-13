@@ -38,7 +38,7 @@ Mipmaps are generated at texture upload time inside the same one-time command bu
 
 **Image usage flags:** `TRANSFER_DST | TRANSFER_SRC | SAMPLED`. `TRANSFER_SRC` is required because each mip level (except the last) is read as a blit source after being written.
 
-**Blit format support check:** Before creating the image, the code asserts that `R8G8B8A8_SRGB` supports both `BLIT_SRC` and `BLIT_DST` in optimal tiling (via `get_physical_device_format_properties`). If the device does not support this, the application panics with a clear message.
+**Blit format support check:** Before creating the image, the code asserts that the chosen image format supports both `BLIT_SRC` and `BLIT_DST` in optimal tiling (via `get_physical_device_format_properties`). The textured-cube path uses `R8G8B8A8_SRGB`; later glTF data textures use linear formats such as `R8G8B8A8_UNORM`. If the device does not support blitting for the chosen format, the application panics with a clear message.
 
 **Command buffer sequence:**
 

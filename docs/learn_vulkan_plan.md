@@ -189,7 +189,7 @@ Standard hello-triangle path, mapped to ash 0.38 APIs.
 - One queue per unique family. Enable the `khr::swapchain` device extension.
 
 ### 4.5 Swapchain — `swapchain.rs`
-- Prefer surface format `B8G8R8A8_SRGB` + `SRGB_NONLINEAR`.
+- Prefer surface format `B8G8R8A8_SRGB` + `SRGB_NONLINEAR`. Shaders should output linear color to this sRGB attachment; do not manually gamma-encode in the fragment shader for this path.
 - Present mode: `MAILBOX` if available, else `FIFO`.
 - Extent clamped to surface caps using the current window inner size.
 - Image view per swapchain image.
