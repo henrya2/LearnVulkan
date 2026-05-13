@@ -234,3 +234,24 @@ fragment shader runs.
   accessor bytes without coordinate transformation.
 - **`glam` crate** v0.32 — `Mat4::look_to_lh`, `Mat4::perspective_lh`,
   `Vec3::cross` (fixed algebraic formula, basis-agnostic).
+
+# Additional notes
+**Note on handedness and winding intuition:**
+A fixed index order `(i0, i1, i2)` viewed from the same physical side of the
+surface appears CCW in one handedness and CW in the opposite handedness —
+handedness flips the *label*, not the geometry. glTF authors content as
+"CCW = front in RH" (§1). After this project's Z-negate, that same index order
+is "CW from outside in LH world" (§3c).
+
+The pipeline's `frontFace` is a *separate* choice that determines which
+framebuffer-space winding is treated as front (§7). **LH coordinates do not
+require CW front faces.** Many LH engines (Unreal, this project) use CCW front;
+DirectX defaults to CW front via `FrontCounterClockwise = FALSE` but exposes the
+flag precisely because CCW is equally valid. The decisive winding for culling
+is the one measured in framebuffer coordinates, after every transform including
+the viewport (Vulkan 1.3 §28.4) — not the winding in world or NDC space.
+
+## My own notes
+The original model should be CCW winding orientation for front face if assuming to be right handed coordinate. If the model is in left handed coordinate, it should be CW winding orientation for front face (not implemented for other type of model than glTF yet.). 
+
+Since glTF 2.0 uses right-handed coordinates by default, the original model should be CCW winding orientation for front face.
