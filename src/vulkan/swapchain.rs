@@ -3,18 +3,45 @@ use ash::vk;
 pub struct SwapchainData {
     pub swapchain: vk::SwapchainKHR,
     pub swapchain_loader: ash::khr::swapchain::Device,
-    #[allow(dead_code)]
     pub images: Vec<vk::Image>,
     pub image_views: Vec<vk::ImageView>,
     pub framebuffers: Vec<vk::Framebuffer>,
     pub extent: vk::Extent2D,
-    #[allow(dead_code)]
     pub image_format: vk::Format,
+    pub image_color_space: vk::ColorSpaceKHR,
     pub depth_image: vk::Image,
     pub depth_memory: vk::DeviceMemory,
     pub depth_view: vk::ImageView,
     #[allow(dead_code)]
     pub depth_format: vk::Format,
+}
+
+pub fn select_surface_format(
+    surface_loader: &ash::khr::surface::Instance,
+    physical_device: vk::PhysicalDevice,
+    surface: vk::SurfaceKHR,
+) -> vk::SurfaceFormatKHR {
+    let formats = unsafe {
+        surface_loader
+            .get_physical_device_surface_formats(physical_device, surface)
+            .unwrap()
+    };
+
+    if formats.len() == 1 && formats[0].format == vk::Format::UNDEFINED {
+        return vk::SurfaceFormatKHR {
+            format: vk::Format::B8G8R8A8_SRGB,
+            color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
+        };
+    }
+
+    formats
+        .iter()
+        .find(|f| {
+            f.format == vk::Format::B8G8R8A8_SRGB
+                && f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
+        })
+        .copied()
+        .unwrap_or(formats[0])
 }
 
 pub fn find_depth_format(
@@ -49,6 +76,7 @@ pub fn create_swapchain(
     window_width: u32,
     window_height: u32,
     render_pass: vk::RenderPass,
+    surface_format: vk::SurfaceFormatKHR,
 ) -> SwapchainData {
     let caps = unsafe {
         surface_loader
@@ -56,25 +84,11 @@ pub fn create_swapchain(
             .unwrap()
     };
 
-    let formats = unsafe {
-        surface_loader
-            .get_physical_device_surface_formats(physical_device, surface)
-            .unwrap()
-    };
     let present_modes = unsafe {
         surface_loader
             .get_physical_device_surface_present_modes(physical_device, surface)
             .unwrap()
     };
-
-    let surface_format = formats
-        .iter()
-        .find(|f| {
-            f.format == vk::Format::B8G8R8A8_SRGB
-                && f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
-        })
-        .copied()
-        .unwrap_or(formats[0]);
 
     let present_mode = present_modes
         .iter()
@@ -223,6 +237,7 @@ pub fn create_swapchain(
         framebuffers,
         extent,
         image_format: surface_format.format,
+        image_color_space: surface_format.color_space,
         depth_image,
         depth_memory,
         depth_view,
@@ -232,12 +247,12 @@ pub fn create_swapchain(
 
 pub fn cleanup_swapchain(device: &ash::Device, data: &mut SwapchainData) {
     unsafe {
-        device.destroy_image_view(data.depth_view, None);
-        device.destroy_image(data.depth_image, None);
-        device.free_memory(data.depth_memory, None);
         for &fb in &data.framebuffers {
             device.destroy_framebuffer(fb, None);
         }
+        device.destroy_image_view(data.depth_view, None);
+        device.destroy_image(data.depth_image, None);
+        device.free_memory(data.depth_memory, None);
         for &view in &data.image_views {
             device.destroy_image_view(view, None);
         }

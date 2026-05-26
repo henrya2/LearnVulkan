@@ -12,7 +12,7 @@ use crate::vulkan::environment_map::create_synthetic_environment_map;
 use crate::vulkan::pbr_ubo::{GlobalUniforms, PushConstants};
 use crate::vulkan::pipeline::{PipelineData, create_pbr_pipeline, create_render_pass};
 use crate::vulkan::swapchain::{
-    SwapchainData, cleanup_swapchain, create_swapchain, find_depth_format,
+    SwapchainData, cleanup_swapchain, create_swapchain, find_depth_format, select_surface_format,
 };
 use ash::vk;
 
@@ -49,8 +49,10 @@ impl Renderer {
     pub fn new(ctx: &VulkanContext, window_width: u32, window_height: u32) -> Self {
         let swapchain_loader = ash::khr::swapchain::Device::new(&ctx.instance, &ctx.device);
 
+        let surface_format =
+            select_surface_format(&ctx.surface_loader, ctx.physical_device, ctx.surface);
         let depth_format = find_depth_format(&ctx.instance, ctx.physical_device);
-        let render_pass = create_render_pass(&ctx.device, vk::Format::B8G8R8A8_SRGB, depth_format);
+        let render_pass = create_render_pass(&ctx.device, surface_format.format, depth_format);
 
         let swapchain = create_swapchain(
             &ctx.instance,
@@ -62,6 +64,7 @@ impl Renderer {
             window_width,
             window_height,
             render_pass,
+            surface_format,
         );
 
         let command_pool = {
@@ -529,6 +532,10 @@ impl Renderer {
         }
 
         let swapchain_loader = ash::khr::swapchain::Device::new(&ctx.instance, &ctx.device);
+        let surface_format = vk::SurfaceFormatKHR {
+            format: self.swapchain.image_format,
+            color_space: self.swapchain.image_color_space,
+        };
         let swapchain = create_swapchain(
             &ctx.instance,
             &ctx.device,
@@ -539,6 +546,7 @@ impl Renderer {
             self.swapchain.extent.width,
             self.swapchain.extent.height,
             self.pipeline.render_pass,
+            surface_format,
         );
 
         let mut render_finished = Vec::with_capacity(swapchain.images.len());
@@ -604,7 +612,13 @@ impl Drop for Renderer {
 
             self.env_map.destroy(&self.device);
 
-            for ub in &self.global_uniforms {
+            for (ub, mapped) in self
+                .global_uniforms
+                .iter()
+                .zip(self.global_mapped.iter_mut())
+            {
+                self.device.unmap_memory(ub.memory);
+                *mapped = std::ptr::null_mut();
                 ub.destroy(&self.device);
             }
 

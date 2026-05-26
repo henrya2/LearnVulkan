@@ -78,8 +78,8 @@ Tracks keyboard state (WASD, Space, LShift, LAlt) and mouse delta. `drain_mouse_
 ### Mesh (`src/mesh.rs`)
 
 Two vertex types:
-- `Vertex { pos: [f32; 3], uv: [f32; 2] }` — stride 20 B, used by the legacy scene pipeline (cube/floor). Attribute 0: `R32G32B32_SFLOAT` at offset 0; attribute 1: `R32G32_SFLOAT` at offset 12.
-- `PbrVertex { pos: [f32; 3], normal: [f32; 3], tangent: [f32; 4], uv0: [f32; 2] }` — stride 48 B, used by the PBR pipeline. Attribute 0: `R32G32B32_SFLOAT` at offset 0; attribute 1: `R32G32B32_SFLOAT` at offset 12; attribute 2: `R32G32B32A32_SFLOAT` at offset 24; attribute 3: `R32G32_SFLOAT` at offset 40.
+- `Vertex { pos: [f32; 3], uv: [f32; 2] }` — legacy procedural mesh vertex type retained for cube/floor helpers. Attribute 0: `R32G32B32_SFLOAT` at offset 0; attribute 1: `R32G32_SFLOAT` at offset 12.
+- `PbrVertex { pos: [f32; 3], normal: [f32; 3], tangent: [f32; 4], uv0: [f32; 2] }` — stride 48 B, used by the active PBR pipeline. Attribute 0: `R32G32B32_SFLOAT` at offset 0; attribute 1: `R32G32B32_SFLOAT` at offset 12; attribute 2: `R32G32B32A32_SFLOAT` at offset 24; attribute 3: `R32G32_SFLOAT` at offset 40.
 
 Procedural mesh helpers:
 - `cube(size)` -> 24 verts, 36 indices, CCW-from-outside in LH world.
@@ -104,10 +104,7 @@ Procedural mesh helpers:
   - Global layout (set 0): binding 0 = `UNIFORM_BUFFER` (vertex+fragment) for `GlobalUniforms`; binding 1 = `UNIFORM_BUFFER` (fragment) for material buffer; binding 2 = `COMBINED_IMAGE_SAMPLER` (fragment) for environment map.
   - Material layout (set 1): bindings 0-4 = `COMBINED_IMAGE_SAMPLER` (fragment) for base_color, metallic_roughness, normal, occlusion, emissive textures.
   `create_descriptor_pool(device, num_materials)` sizes the pool for `MAX_FRAMES_IN_FLIGHT` global sets plus one per material.
-- **`pipeline.rs`**: Two pipeline creation functions:
-  - `create_pipeline`: legacy scene pipeline (cube/floor) with `Vertex` input, single descriptor set layout, no push constants.
-  - `create_pbr_pipeline`: PBR pipeline with `PbrVertex` input, two descriptor set layouts (global + material), push constants for model matrix + material index.
-  Both share: render pass (color + depth attachments), depth-stencil (`LESS`), `COUNTER_CLOCKWISE` front face, `BACK` cull mode. Viewport and scissor are dynamic state.
+- **`pipeline.rs`**: Creates the shared render pass and active PBR graphics pipeline. `create_pbr_pipeline` uses `PbrVertex` input, two descriptor set layouts (global + material), and push constants for model matrix + material index. The pipeline uses depth-stencil (`LESS`), `COUNTER_CLOCKWISE` front face, `BACK` cull mode, and dynamic viewport/scissor state.
 - **`pbr_ubo.rs`**: `GlobalUniforms { view, proj, camera_pos, _pad0, light_dir, light_intensity }` (160 B) and `PushConstants { model, material_index, _pad }` (80 B), both bytemuck POD.
 - **`environment_map.rs`**: `create_synthetic_environment_map` generates a 256x128 RGBA8 gradient texture (warm studio-like soft gradient: brighter at top, darker at bottom) uploaded as `R8G8B8A8_UNORM` because it is sampled as lighting data. Used as a placeholder environment map for simplified IBL.
 - **`debug_marker.rs`**: Thin wrapper over `ash::ext::debug_utils::Device` for `VK_EXT_debug_utils`. Provides command-buffer labels and Vulkan object names for RenderDoc in all builds.

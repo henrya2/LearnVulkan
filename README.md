@@ -82,7 +82,6 @@ LearnVulkan/
 │   ├── debug_marker_plan.md   # RenderDoc debug marker plan
 │   └── review/                # Code review notes
 ├── shaders/
-│   ├── scene.vert / .frag     # Legacy scene shaders (cube/floor)
 │   ├── pbr.vert / .frag       # PBR vertex + fragment shaders
 │   ├── compile.bat            # Offline shader compile script
 │   └── *.spv                  # Compiled SPIR-V binaries
@@ -106,7 +105,7 @@ LearnVulkan/
         ├── texture.rs         # RGBA8 upload with explicit format, runtime mipmap generation
         ├── descriptors.rs     # Global + material descriptor set layouts, pool
         ├── debug_marker.rs    # VK_EXT_debug_utils labels/object names for RenderDoc
-        ├── pipeline.rs        # Render pass, legacy + PBR graphics pipelines
+        ├── pipeline.rs        # Render pass and PBR graphics pipeline
         ├── renderer.rs        # Command buffers, sync, per-frame UBOs, draw_frame
         ├── pbr_ubo.rs         # GlobalUniforms + PushConstants structs
         └── environment_map.rs # Synthetic environment map generation
