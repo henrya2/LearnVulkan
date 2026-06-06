@@ -1,6 +1,6 @@
 # LearnVulkan
 
-A Vulkan PBR renderer written in Rust. It loads and renders glTF 2.0 models (DamagedHelmet) with metallic-roughness PBR shading, normal mapping, and a synthetic environment map placeholder for image-based lighting, in an 800x600 window using raw Vulkan bindings (`ash`).
+A Vulkan PBR renderer written in Rust. It loads and renders glTF 2.0 models (DamagedHelmet) with metallic-roughness PBR shading, normal mapping, and image-based lighting from the Ennis glTF sample environment (KTX2 cubemaps under `assets/environment_map/ennis/`), in an 800x600 window using raw Vulkan bindings (`ash`).
 
 ## Features
 
@@ -9,7 +9,7 @@ A Vulkan PBR renderer written in Rust. It loads and renders glTF 2.0 models (Dam
 - **Normal mapping** with TBN tangent-space construction
 - **Per-material textures**: base color, metallic-roughness, normal, occlusion, emissive (with semantic-specific 1x1 fallbacks)
 - **glTF texture color-space handling**: base color/emissive are uploaded as sRGB; normal/metallic-roughness/occlusion are uploaded as linear UNORM
-- **Synthetic LDR environment map** for simplified placeholder IBL
+- **Image-based lighting (IBL)**: env cubemap + irradiance + GGX prefilter from the Ennis glTF sample environment (KTX2 in `assets/environment_map/ennis/`), plus a procedurally generated BRDF LUT
 - **Per-frame uniform buffer** for view/proj/camera/light data (descriptor set, no push constants for globals)
 - **Per-draw push constants** for model matrix + material index (80 B)
 - **Free-fly FPS camera**:
@@ -38,6 +38,7 @@ A Vulkan PBR renderer written in Rust. It loads and renders glTF 2.0 models (Dam
 **Prerequisites:**
 - [Vulkan SDK](https://vulkan.lunarg.com/) installed so `glslc` is on `PATH`.
 - `assets/models/DamagedHelmet/` present with the glTF model and textures.
+- `assets/environment_map/ennis/` present with the KTX2 cubemaps (env/irradiance/prefilter).
 
 ```bash
 # Compile shaders
@@ -72,8 +73,10 @@ LearnVulkan/
 ├── assets/
 │   ├── gen_texture.py         # uv-runnable placeholder PNG generator (PEP-723)
 │   ├── texture.png            # Legacy placeholder texture
-│   └── models/
-│       └── DamagedHelmet/     # glTF model with PBR textures
+│   ├── models/
+│   │   └── DamagedHelmet/     # glTF model with PBR textures
+│   └── environment_map/
+│       └── ennis/             # KTX2 cubemaps for IBL (lambertian/, ggx/)
 ├── docs/
 │   ├── learn_vulkan_plan.md   # Original triangle plan
 │   ├── vulkan_fps_plan.md     # FPS camera + scene plan
@@ -108,7 +111,10 @@ LearnVulkan/
         ├── pipeline.rs        # Render pass and PBR graphics pipeline
         ├── renderer.rs        # Command buffers, sync, per-frame UBOs, draw_frame
         ├── pbr_ubo.rs         # GlobalUniforms + PushConstants structs
-        └── environment_map.rs # Synthetic environment map generation
+        ├── cubemap.rs         # Cubemap Vulkan wrapper
+        ├── ktx2_loader.rs     # KTX2 cubemap loader
+        ├── brdf_lut.rs        # Procedural BRDF integration LUT generator
+        └── ibl.rs             # IBL resources: env cubemap + irradiance + prefilter + BRDF LUT
 ```
 
 ## Architecture Highlights
@@ -117,10 +123,11 @@ LearnVulkan/
 - **Viewport flip:** `vk::Viewport.height` is negative with `y = extent.height`, preserving Y-up orientation from NDC to screen space. `front_face` is `COUNTER_CLOCKWISE` because the negative viewport height preserves (does not reverse) winding order.
 - **glTF RH-to-LH conversion:** Negate Z in positions, normals, tangent xyz; flip tangent.w; convert transform matrices via `diag(1,1,-1,1) * M * diag(1,1,-1,1)`.
 - **glTF scene loading:** loads the default scene, or scene 0 if no default is declared. Primitives without explicit materials use an explicit glTF default material.
-- **Descriptor strategy:** Two descriptor sets — set 0 (per-frame): global UBO (view/proj/camera/light) + material buffer + env map; set 1 (per-material): 5 combined image samplers (base_color, metallic_roughness, normal, occlusion, emissive). No descriptor indexing required.
+- **Descriptor strategy:** Two descriptor sets — set 0 (per-frame): global UBO (view/proj/camera/light) + material buffer + IBL textures (irradiance, GGX prefilter, BRDF LUT, env cubemap); set 1 (per-material): 5 combined image samplers (base_color, metallic_roughness, normal, occlusion, emissive). No descriptor indexing required.
+- **IBL assets:** the renderer reads Ennis KTX2 cubemaps from `assets/environment_map/ennis/` via the `ENV_BASE_PATH` constant in `src/vulkan/renderer.rs` (`lambertian/outputCubeMap.ktx2` for the skybox, `lambertian/diffuse.ktx2` for irradiance, `ggx/specular.ktx2` for the prefiltered specular). The BRDF LUT is generated procedurally on the GPU at startup.
 - **Per-frame UBOs:** one `HOST_VISIBLE | HOST_COHERENT` buffer per in-flight frame (160 B), persistently mapped. Written after fence wait, before submit.
 - **Per-draw push constants:** model matrix (64 B) + material index (4 B) + padding (12 B) = 80 B, within the 128 B guaranteed minimum.
-- **Texture upload:** staging buffer -> device-local `vk::Image` via `cmd_copy_buffer_to_image` for mip level 0. Runtime mipmaps are generated on the GPU via `vk::CmdBlitImage`. `Texture::from_rgba8_with_format` takes the Vulkan format explicitly. glTF base-color/emissive textures use `R8G8B8A8_SRGB`; normal, metallic-roughness, occlusion, and the synthetic environment lighting texture use `R8G8B8A8_UNORM`.
+- **Texture upload:** staging buffer -> device-local `vk::Image` via `cmd_copy_buffer_to_image` for mip level 0. Runtime mipmaps are generated on the GPU via `vk::CmdBlitImage`. `Texture::from_rgba8_with_format` takes the Vulkan format explicitly. glTF base-color/emissive textures use `R8G8B8A8_SRGB`; normal, metallic-roughness, and occlusion textures use `R8G8B8A8_UNORM`.
 - **Shader output color:** `pbr.frag` applies ACES tone mapping and outputs linear color; the sRGB swapchain attachment performs final linear-to-sRGB encoding.
 - **Cleanup order:** `Renderer` is dropped before `VulkanContext` via `ManuallyDrop`. Inside the renderer, scene -> env map -> UBOs -> descriptor pool/layouts -> sync -> command pool -> pipeline/layout/render pass -> swapchain.
 - **Sync strategy:** `MAX_FRAMES_IN_FLIGHT = 2`. `render_finished` semaphores are per-swapchain-image to avoid reuse validation errors.

@@ -32,6 +32,8 @@ The high-impact glTF rendering issues from the previous review are fixed:
 
 The remaining visual limitation is IBL quality. The current environment map is a synthetic 2D LDR gradient, useful as a placeholder but not physically based split-sum IBL.
 
+> **Status update (post-review):** IBL has since been implemented by loading the pre-filtered Ennis KTX2 cubemaps from `assets/environment_map/ennis/` (see `correct_pbr_plan.md` and `CODEBUDDY.md` for the path layout). The BRDF LUT is generated procedurally on the GPU at startup. The synthetic 2D LDR placeholder described in the "Remaining visual limitation" paragraph above and the "Future work" / "Rendering quality" item 1 below no longer apply.
+
 ## Issues fixed in this pass
 
 ### 1. Render pass format must match the selected swapchain format
@@ -82,6 +84,7 @@ The per-frame global UBO memory is allocated with `HOST_VISIBLE | HOST_COHERENT`
    - Diffuse irradiance convolution.
    - GGX prefiltered specular cubemap.
    - BRDF integration LUT.
+   > **Done** — see status note above. Ennis KTX2 cubemaps are loaded directly; the BRDF LUT is generated procedurally.
 2. Replace the shader's hardcoded `MAX_REFLECTION_LOD` with data derived from the actual environment map mip count.
 3. Add glTF alpha modes (`MASK`, `BLEND`) and double-sided material support.
 4. Add glTF sampler-state mapping and texture coordinate set selection for slots such as occlusion.

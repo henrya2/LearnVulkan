@@ -79,7 +79,7 @@ src/
     pipeline.rs           # PBR pipeline creation
     renderer.rs           # refactored: owns Scene, materials, textures, UBOs
     pbr_ubo.rs            # uniform buffer structs (bytemuck POD)
-    environment_map.rs    # cubemap generation / loading for IBL
+    environment_map.rs    # cubemap generation / loading for IBL (replaced by ibl.rs + KTX2 loader under `assets/environment_map/ennis/`)
 ```
 
 ---
@@ -310,7 +310,7 @@ Implements the **glTF 2.0 metallic-roughness PBR model** with IBL.
    - **Diffuse:** Sample a pre-filtered irradiance cubemap with `N`. Multiply by `kD * base_color`.
    - **Specular:** Sample a pre-filtered radiance cubemap with `R = reflect(-V, N)` and LOD based on roughness. Multiply by `kS * envBRDF(NdotV, roughness)` where `envBRDF` is sampled from a 2D LUT (or approximated).
    - **Simplification for plan:** Since generating irradiance / radiance / BRDF LUT cubemaps offline is a large task, we can approximate IBL with a single pre-convolved environment cubemap and a simplified Fresnel term. However, to match the screenshot quality, proper IBL is strongly recommended.
-   - **Decision:** Implement full IBL with runtime-generated irradiance and prefiltered maps from a loaded HDR environment map, OR load a pre-generated `.ktx2` cubemap. Given the complexity, the plan will describe the runtime generation approach but note that a pre-generated cubemap is an acceptable shortcut.
+   - **Decision (as implemented):** Load the pre-filtered Ennis KTX2 cubemaps from `assets/environment_map/ennis/` (project-relative — see `correct_pbr_plan.md` and `CODEBUDDY.md` for the path layout). The BRDF LUT is generated procedurally on the GPU at startup. This avoids runtime equirect-to-cube and convolution shaders.
 
 6. **Ambient occlusion:** Apply glTF occlusion strength as `mix(1.0, ao, strength)`. In the current simplified IBL shader, AO is applied to diffuse environment lighting.
 
@@ -808,6 +808,6 @@ Add `jpeg` feature to `image` for glTF JPEG textures.
 3. **Descriptor strategy:** Two sets — set 0 per-frame global UBO, set 1 per-material textures. No descriptor indexing required.
 4. **Per-draw data:** Push constants for model matrix + material index.
 5. **Material data:** Device-local uniform buffer with `GpuMaterial` array, indexed by push constant.
-6. **IBL:** Current implementation uses a synthetic LDR 2D environment map as a simplified placeholder. Full HDR equirect-to-cube, irradiance convolution, prefiltered specular, and BRDF LUT remain future work.
+6. **IBL:** Load pre-filtered Ennis KTX2 cubemaps from `assets/environment_map/ennis/` (see `correct_pbr_plan.md` for the path layout). BRDF LUT is generated procedurally on the GPU at startup. This replaced the synthetic LDR 2D placeholder and avoided the runtime equirect-to-cube / convolution pipeline.
 7. **Cleanup:** Explicit destroy order in `Renderer::drop`, `Scene::destroy` called first.
 8. **No animation:** Static mesh only; scene graph flattened at load time.
