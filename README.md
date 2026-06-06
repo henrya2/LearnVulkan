@@ -19,6 +19,10 @@ A Vulkan PBR renderer written in Rust. It loads and renders glTF 2.0 models (Dam
   - Click-to-lock cursor behavior
 - **Clean Vulkan bring-up** with validation layers in debug builds, plus opt-in validation in non-debug builds with `--validation` / `--validate`
 - **RenderDoc-friendly debug markers** via `VK_EXT_debug_utils` in all builds: labeled frame/render-pass/mesh regions and named GPU resources
+- **HDR bloom**: 8-mip separable Gaussian blur with Frostbite-style soft knee threshold
+- **Runtime-switchable tonemapping**: Linear / Reinhard / ACES with stops-based exposure control
+- **Skybox rendering** with the environment cubemap (`LESS_OR_EQUAL` depth, depth writes disabled)
+- **Fullscreen-triangle postprocessing framework**: extensible design with shared vertex shader and per-effect fragment shaders
 
 ## Tech Stack
 
@@ -31,6 +35,7 @@ A Vulkan PBR renderer written in Rust. It loads and renders glTF 2.0 models (Dam
 | Buffer uploads | `bytemuck` |
 | Image loading | `image` 0.25 (PNG + JPEG) |
 | Model loading | `gltf` 1.4 (import + utils) |
+| KTX2 loading | `ktx2` 0.3 |
 | Shaders | GLSL compiled offline to SPIR-V via `glslc` |
 
 ## Build & Run
@@ -83,10 +88,19 @@ LearnVulkan/
 │   ├── textured_cube_plan.md  # Texturing + UBO refactor plan
 │   ├── glTF_rendering_plan.md # glTF PBR rendering plan
 │   ├── debug_marker_plan.md   # RenderDoc debug marker plan
+│   ├── postprocessing_plan.md # Bloom + tonemapping postprocess design
+│   ├── winding_orientation.md # Full winding math (glTF -> Vulkan pipeline)
 │   └── review/                # Code review notes
 ├── shaders/
 │   ├── pbr.vert / .frag       # PBR vertex + fragment shaders
+│   ├── skybox.vert / .frag    # Skybox vertex + fragment shaders
+│   ├── brdf_lut.vert / .frag  # BRDF integration LUT generation shaders
 │   ├── compile.bat            # Offline shader compile script
+│   ├── postprocess/           # Fullscreen-triangle postprocess shaders
+│   │   ├── fullscreen.vert    # Shared fullscreen-triangle vertex shader
+│   │   ├── bright.frag        # Soft-knee highlight extraction
+│   │   ├── blur.frag          # 9-tap separable Gaussian blur
+│   │   └── composite.frag     # Scene + bloom composite + tonemapping
 │   └── *.spv                  # Compiled SPIR-V binaries
 └── src/
     ├── main.rs                # winit ApplicationHandler entry point
@@ -114,13 +128,22 @@ LearnVulkan/
         ├── cubemap.rs         # Cubemap Vulkan wrapper
         ├── ktx2_loader.rs     # KTX2 cubemap loader
         ├── brdf_lut.rs        # Procedural BRDF integration LUT generator
-        └── ibl.rs             # IBL resources: env cubemap + irradiance + prefilter + BRDF LUT
+        ├── ibl.rs             # IBL resources: env cubemap + irradiance + prefilter + BRDF LUT
+        └── postprocess/
+            ├── mod.rs          # Re-exports: BloomPyramid, PostProcessResources, etc.
+            ├── passes.rs       # Three render passes: HDR scene, color (no depth), composite (sRGB)
+            ├── resources.rs    # PostProcessResources: images, views, framebuffers, pipelines, descriptors, UBOs
+            ├── ubo.rs          # PostProcessUBO (64B, std140) + BlurPushConstants (16B)
+            ├── pyramid.rs      # BloomPyramid: 2 images x 8 mips (R16G16B16A16_SFLOAT)
+            ├── descriptors.rs  # Postprocess descriptor set layouts: UBO, single-input, composite-input
+            ├── fullscreen.rs   # Fullscreen-triangle pipeline builder
+            └── pass_trait.rs   # PostProcessPass trait + shared viewport/scissor helper
 ```
 
 ## Architecture Highlights
 
 - **Coordinate system:** Left-handed, Y-up. `+Z` is forward. No projection Y flip; the flip is done via negative viewport height instead.
-- **Viewport flip:** `vk::Viewport.height` is negative with `y = extent.height`, preserving Y-up orientation from NDC to screen space. `front_face` is `COUNTER_CLOCKWISE` because the negative viewport height preserves (does not reverse) winding order.
+- **Viewport flip:** `vk::Viewport.height` is negative with `y = extent.height`. This is a y-axis reflection (det = -1) that flips winding once in framebuffer space. Combined with the Z-negation applied at glTF load time (another det = -1 transform), the two improper transforms cancel, and triangles end up CCW in framebuffer space — matching `front_face = COUNTER_CLOCKWISE` with `cull_mode = BACK`. See `docs/winding_orientation.md` for the full derivation.
 - **glTF RH-to-LH conversion:** Negate Z in positions, normals, tangent xyz; flip tangent.w; convert transform matrices via `diag(1,1,-1,1) * M * diag(1,1,-1,1)`.
 - **glTF scene loading:** loads the default scene, or scene 0 if no default is declared. Primitives without explicit materials use an explicit glTF default material.
 - **Descriptor strategy:** Two descriptor sets — set 0 (per-frame): global UBO (view/proj/camera/light) + material buffer + IBL textures (irradiance, GGX prefilter, BRDF LUT, env cubemap); set 1 (per-material): 5 combined image samplers (base_color, metallic_roughness, normal, occlusion, emissive). No descriptor indexing required.
@@ -128,8 +151,17 @@ LearnVulkan/
 - **Per-frame UBOs:** one `HOST_VISIBLE | HOST_COHERENT` buffer per in-flight frame (160 B), persistently mapped. Written after fence wait, before submit.
 - **Per-draw push constants:** model matrix (64 B) + material index (4 B) + padding (12 B) = 80 B, within the 128 B guaranteed minimum.
 - **Texture upload:** staging buffer -> device-local `vk::Image` via `cmd_copy_buffer_to_image` for mip level 0. Runtime mipmaps are generated on the GPU via `vk::CmdBlitImage`. `Texture::from_rgba8_with_format` takes the Vulkan format explicitly. glTF base-color/emissive textures use `R8G8B8A8_SRGB`; normal, metallic-roughness, and occlusion textures use `R8G8B8A8_UNORM`.
-- **Shader output color:** `pbr.frag` applies ACES tone mapping and outputs linear color; the sRGB swapchain attachment performs final linear-to-sRGB encoding.
-- **Cleanup order:** `Renderer` is dropped before `VulkanContext` via `ManuallyDrop`. Inside the renderer, scene -> env map -> UBOs -> descriptor pool/layouts -> sync -> command pool -> pipeline/layout/render pass -> swapchain.
+- **Shader output color:** `pbr.frag` and `skybox.frag` output **linear HDR** radiance (no tonemapping or gamma correction). The postprocess composite pass applies exposure + tonemapping (Linear/Reinhard/ACES) and writes to the sRGB swapchain attachment; Vulkan performs final linear-to-sRGB encoding on store. Tonemapping and gamma correction belong exclusively in the postprocess chain.
+- **Postprocessing framework:** A chain of fullscreen-triangle render passes executing after the scene pass, within the same command buffer:
+  1. **Scene render pass** — PBR + skybox to HDR `R16G16B16A16_SFLOAT` scene color (with depth)
+  2. **Bright pass** — Soft-knee highlight extraction -> bloom mip 0
+  3. **Blur passes** — 16 render passes (8 horizontal + 8 vertical) for separable Gaussian downsampling across 8 bloom mips
+  4. **Composite pass** — Scene color + 8 bloom mips -> `pow(2, exposure)` -> tonemap (Linear/Reinhard/ACES) -> sRGB swapchain
+  - Postprocess pipelines use `cull_mode = NONE` (fullscreen triangle is CW under Y-flip viewport).
+  - Descriptor sets: set 0 = input samplers (1 for bright/blur, 9 for composite), set 1 = postprocess UBO (exposure, bloom parameters, tonemap operator).
+  - Adding a new effect: implement `PostProcessPass` trait, allocate framebuffer + descriptor sets, insert `.record()` in the command buffer.
+- **Skybox:** Unit cube rendered with `LESS_OR_EQUAL` depth test and depth writes disabled, so it only appears where no geometry is drawn. The skybox shader strips view translation (`mat3(view)`) to keep the environment infinitely distant. Share the same `front_face = COUNTER_CLOCKWISE` / `cull_mode = BACK` as PBR; the camera-on-inside produces CCW-in-framebuffer windings (one Y-flip viewport reflection). See `docs/winding_orientation.md` §§S1-S8 for the full derivation.
+- **Cleanup order:** `Renderer` is dropped before `VulkanContext` via `ManuallyDrop`. Inside the renderer: `device_wait_idle` -> scene -> IBL -> skybox buffers -> skybox pipeline -> global UBOs -> main descriptor pool/layouts -> fences/semaphores -> command pool -> PBR pipeline -> postprocess resources (pipelines, render passes, descriptor pool, bloom pyramid, scene color images) -> swapchain.
 - **Sync strategy:** `MAX_FRAMES_IN_FLIGHT = 2`. `render_finished` semaphores are per-swapchain-image to avoid reuse validation errors.
 - **RenderDoc debug markers:** `VK_EXT_debug_utils` is enabled in all builds. Command buffers contain frame/render-pass/per-mesh label regions, and major Vulkan objects are named for RenderDoc resource inspection.
 - **Validation layers:** `VK_LAYER_KHRONOS_validation` is enabled by default in debug builds. In non-debug builds, launch with `--validation` or `--validate` to enable it.
