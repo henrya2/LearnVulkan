@@ -8,6 +8,7 @@ pub mod ibl;
 pub mod ktx2_loader;
 pub mod pbr_ubo;
 pub mod pipeline;
+pub mod postprocess;
 pub mod renderer;
 pub mod swapchain;
 pub mod texture;

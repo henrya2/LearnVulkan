@@ -75,7 +75,7 @@ pub fn create_swapchain(
     surface: vk::SurfaceKHR,
     window_width: u32,
     window_height: u32,
-    render_pass: vk::RenderPass,
+    composite_render_pass: vk::RenderPass,
     surface_format: vk::SurfaceFormatKHR,
 ) -> SwapchainData {
     let caps = unsafe {
@@ -218,14 +218,19 @@ pub fn create_swapchain(
     let framebuffers: Vec<_> = image_views
         .iter()
         .map(|&view| {
-            let attachments = [view, depth_view];
-            let create_info = vk::FramebufferCreateInfo::default()
-                .render_pass(render_pass)
-                .attachments(&attachments)
-                .width(extent.width)
-                .height(extent.height)
-                .layers(1);
-            unsafe { device.create_framebuffer(&create_info, None).unwrap() }
+            // The composite render pass has only a color attachment (the
+            // swapchain image), so the framebuffer must have only 1
+            // attachment too.
+            let attachments = [view];
+            unsafe { device.create_framebuffer(
+                &vk::FramebufferCreateInfo::default()
+                    .render_pass(composite_render_pass)
+                    .attachments(&attachments)
+                    .width(extent.width)
+                    .height(extent.height)
+                    .layers(1),
+                None,
+            ).unwrap() }
         })
         .collect();
 
