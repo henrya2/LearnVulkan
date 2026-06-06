@@ -563,7 +563,7 @@ glslc skybox.frag -o skybox.frag.spv
 |------|-----------|
 | KTX2 face orientation in LH | Test with known environment; may need to flip Z on sample direction in shaders |
 | R16G16B16A16_SFLOAT format support | Add format checks with `get_physical_device_format_properties` |
-| Skybox winding with negative viewport | FRONT culling for skybox; verify visually and swap if needed |
+| Skybox winding with negative viewport | `cull_mode = BACK` for skybox; the cube is CCW-from-outside in LH Y-up, and the only improper transform in the world→framebuffer chain is the Y-flip viewport, so the visible interior surfaces are CCW-in-framebuffer. See `docs/winding_orientation.md` §"Skybox Winding — Why `cull_mode = BACK`" for the full derivation. |
 | KTX2 level data layout | Verify by reading header; face data is sequential within each level |
 | BRDF LUT pipeline temp resources | Clean up pipeline, framebuffer, render pass after generation |
 | Large KTX2 files (~170MB total) | Acceptable for a learning project; files are memory-mapped by OS |

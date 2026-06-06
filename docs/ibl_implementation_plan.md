@@ -339,4 +339,4 @@ Add names for IBL resources and skybox. Remove old "Synthetic Environment Map" n
 2. **HDR tone mapping range** - ACES handles this; add exposure multiplier later if needed
 3. **Startup time (~53MB HDR)** - acceptable for learning project
 4. **R32G32B32A32_SFLOAT format support** - add format checks with clear errors
-5. **Skybox winding with negative viewport** - use FRONT culling; swap if skybox invisible
+5. **Skybox winding with negative viewport** - use `cull_mode = BACK` (the same as the PBR pipeline). The cube index buffer is CCW-from-outside in LH Y-up, and the Y-flip viewport is the only improper transform in the world→framebuffer chain, so the visible interior surfaces are CCW-in-framebuffer. See `docs/winding_orientation.md` §"Skybox Winding — Why `cull_mode = BACK`" for the full derivation.

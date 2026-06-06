@@ -135,3 +135,6 @@ Procedural mesh helpers:
   - `assets/environment_map/ennis/` is a runtime dependency containing the IBL cubemap (KTX2). The renderer reads from this project-relative path via `ENV_BASE_PATH` in `src/vulkan/renderer.rs`. Layout: `lambertian/outputCubeMap.ktx2` (env cubemap), `lambertian/diffuse.ktx2` (irradiance), `ggx/specular.ktx2` (prefilter).
 - **Debug markers**: RenderDoc labels and object names must work in every build configuration. Keep `VK_EXT_debug_utils` enabled independently of validation layers.
 - **Validation layers**: active by default in debug builds and enabled in non-debug builds with `--validation` or `--validate`. A clean shutdown produces no validation errors.
+
+# Special notes
+@docs/winding_orientation.md
