@@ -4,7 +4,7 @@ This file provides guidance to CodeBuddy Code when working with code in this rep
 
 ## Project Overview
 
-A Vulkan PBR renderer written in Rust. It loads and renders a **glTF 2.0 model** (DamagedHelmet) with metallic-roughness PBR shading and a prefiltered Ennis environment map (KTX2 cubemaps under `assets/environment_map/ennis/`) used for full image-based lighting (env cubemap, irradiance, GGX prefilter, BRDF LUT), in an 800x600 window using raw Vulkan bindings (`ash`). The camera is a free-fly FPS style with mouse look (pitch/yaw), WASD movement, Space/LShift for vertical movement, and click-to-lock cursor behavior.
+A Vulkan PBR renderer written in Rust. It loads and renders a **glTF 2.0 model** (DamagedHelmet) with metallic-roughness PBR shading and a prefiltered Ennis environment map (KTX2 cubemaps under `assets/environment_map/ennis/`) used for full image-based lighting (env cubemap, irradiance, GGX prefilter, BRDF LUT), in an 800x600 window using raw Vulkan bindings (`ash`). A **postprocessing framework** provides HDR bloom (8-mip separable Gaussian) and runtime-switchable tonemapping (Linear/Reinhard/ACES) with exposure control. The camera is a free-fly FPS style with mouse look (pitch/yaw), WASD movement, Space/LShift for vertical movement, and click-to-lock cursor behavior.
 
 - **Renderer**: `ash` 0.38
 - **Windowing**: `winit` 0.30 with the `ApplicationHandler` trait (no deprecated APIs)
@@ -104,21 +104,47 @@ Procedural mesh helpers:
   - Global layout (set 0): binding 0 = `UNIFORM_BUFFER` (vertex+fragment) for `GlobalUniforms`; binding 1 = `UNIFORM_BUFFER` (fragment) for material buffer; binding 2 = `COMBINED_IMAGE_SAMPLER` (fragment) for irradiance map; binding 3 = `COMBINED_IMAGE_SAMPLER` (fragment) for prefilter (GGX) map; binding 4 = `COMBINED_IMAGE_SAMPLER` (fragment) for BRDF LUT; binding 5 = `COMBINED_IMAGE_SAMPLER` (fragment) for environment cubemap (skybox).
   - Material layout (set 1): bindings 0-4 = `COMBINED_IMAGE_SAMPLER` (fragment) for base_color, metallic_roughness, normal, occlusion, emissive textures.
   `create_descriptor_pool(device, num_materials)` sizes the pool for `MAX_FRAMES_IN_FLIGHT` global sets plus one per material.
-- **`pipeline.rs`**: Creates the shared render pass and active PBR graphics pipeline. `create_pbr_pipeline` uses `PbrVertex` input, two descriptor set layouts (global + material), and push constants for model matrix + material index. The pipeline uses depth-stencil (`LESS`), `COUNTER_CLOCKWISE` front face, `BACK` cull mode, and dynamic viewport/scissor state.
+- **`pipeline.rs`**: Creates the PBR and skybox graphics pipelines as `PipelineData` structs (pipeline + pipeline_layout). Render pass creation lives in `postprocess/passes.rs` — `pipeline.rs` receives a pre-created `vk::RenderPass` handle from `create_pbr_pipeline` / `create_skybox_pipeline`. PBR uses `PbrVertex` input, two descriptor set layouts (global + material), and push constants for model matrix + material index. Uses depth-stencil (`LESS`), `COUNTER_CLOCKWISE` front face, `BACK` cull mode, dynamic viewport/scissor. Skybox pipeline uses a 3D position vertex input, one descriptor set layout (global), `LESS_OR_EQUAL` depth with writes disabled, and the same front-face/cull settings.
 - **`pbr_ubo.rs`**: `GlobalUniforms { view, proj, camera_pos, _pad0, light_dir, light_intensity }` (160 B) and `PushConstants { model, material_index, _pad }` (80 B), both bytemuck POD.
 - **`ibl.rs`**: `IblResources::load(ctx, pool, env_base_path)` loads the Ennis glTF sample environment from the project-relative `assets/environment_map/ennis/` directory (subfolders `lambertian/` for `outputCubeMap.ktx2` + `diffuse.ktx2`, `ggx/` for `specular.ktx2`) via `load_ktx2_cubemap`, and also generates the BRDF LUT via `generate_brdf_lut`. Owns the environment cubemap (sampled by the skybox), irradiance map, prefilter map, and BRDF LUT.
+- **`postprocess/`** — Postprocessing framework with bloom + tonemapping. See `docs/postprocessing_plan.md` for the full design.
+  - **`passes.rs`**: Three render passes: `create_scene_render_pass` (HDR `R16G16B16A16_SFLOAT` + depth), `create_postprocess_color_pass` (single HDR color attachment, no depth, used by bright + blur), `create_composite_render_pass` (sRGB swapchain format, final present).
+  - **`fullscreen.rs`**: `create_fullscreen_pipeline(device, render_pass, extent, layout, frag_code)` builds a fullscreen-triangle pipeline with `cull_mode = NONE` (fullscreen triangle is CW in framebuffer under Y-flip viewport). Shared vertex shader (`fullscreen.vert`) generates triangle from `gl_VertexIndex`.
+  - **`descriptors.rs`**: Three descriptor set layouts: UBO (set 1 for all passes), single-input sampler (set 0 for bright + blur), composite-input (set 0 with 9 bindings: scene color + 8 bloom mips).
+  - **`ubo.rs`**: `PostProcessUBO` (64 B, std140): exposure, bloom threshold/knee/intensity, 8 bloom weights, tonemap_op. `BlurPushConstants` (16 B): `[texel_size, direction, _pad]`.
+  - **`pyramid.rs`**: `BloomPyramid` — 2 single images (`mip` + `temp`) with `BLOOM_MIP_COUNT=8` mip levels each. Per-level views created with `base_mip_level = i`. One `vk::Sampler` (CLAMP_TO_EDGE, LINEAR, no mip).
+  - **`resources.rs`**: `PostProcessResources` — owns all postprocess device objects (images, views, framebuffers, pipelines, descriptor pool/sets, UBOs). `PostProcessSettings` wraps `PostProcessUBO` + `bloom_enabled: bool`. `name_debug_objects` installs RenderDoc names.
+  - **`pass_trait.rs`**: `PostProcessPass` trait for future effects. `set_viewport_and_bind_pipeline` helper enforces Y-flip viewport + scissor + pipeline bind in every pass.
+  - **`mod.rs`**: Public re-exports for `renderer.rs`: `BloomPyramid`, `PostProcessResources`, `BlurPushConstants`, `PostProcessPass`.
+
+  Descriptor numbering for postprocess pipelines:
+  | Pipeline | Set 0 | Set 1 |
+  |---|---|---|
+  | Bright pass | Scene color sampler (1) | Postprocess UBO |
+  | Blur pass | Input sampler (1) | Postprocess UBO + push constants |
+  | Composite | Scene color + 8 bloom mips (9) | Postprocess UBO |
+
+  Per-frame recording order (all in one command buffer):
+  1. Scene render pass (PBR + skybox → HDR scene color)
+  2. Bright pass (extract highlights → bloom mip 0)
+  3. Blur passes (16 render passes: 8 horizontal + 8 vertical, per mip)
+  4. Composite pass (scene + bloom → exposure → tonemap → sRGB swapchain)
+
+  The viewport is the same Y-flip viewport for all passes. Postprocess shaders flip `vUV.y` when sampling previously-rendered images (standard render-to-texture Y-flip). All postprocess pipelines use `cull_mode = NONE`.
 - **`debug_marker.rs`**: Thin wrapper over `ash::ext::debug_utils::Device` for `VK_EXT_debug_utils`. Provides command-buffer labels and Vulkan object names for RenderDoc in all builds.
-- **`renderer.rs`**: Command pool/buffers, sync primitives, per-frame global UBOs, descriptor sets (global per-frame + per-material), scene, environment map, debug marker labels/object naming, and `draw_frame`. Key design choices:
+- **`renderer.rs`**: Command pool/buffers, sync primitives, per-frame global UBOs, descriptor sets (global per-frame + per-material), scene, environment map, postprocess resources, debug marker labels/object naming, and `draw_frame`. Key design choices:
   - `MAX_FRAMES_IN_FLIGHT = 2`
   - `image_available` semaphores are per-frame
   - `render_finished` semaphores are **per-swapchain-image** (not per-frame) to avoid semaphore reuse validation errors
   - `images_in_flight` fences track which frame is using each swapchain image
   - Swapchain is recreated lazily on resize or `SUBOPTIMAL_KHR`/`ERROR_OUT_OF_DATE_KHR`
   - **Per-frame global UBO**: one `HOST_VISIBLE | HOST_COHERENT` buffer per frame, 160 B, persistently mapped. `memcpy` of `GlobalUniforms` happens after the frame's `in_flight` fence wait, before submit.
+  - **Postprocess UBO**: separate `HOST_VISIBLE | HOST_COHERENT` buffer per frame, 64 B. `memcpy` of `PostProcessUBO` from `PostProcessSettings` happens in the same pre-submit window.
   - Global descriptor set (set 0) bound once per command buffer; per-material descriptor set (set 1) bound per mesh draw call.
+  - Postprocess pipelines use their own descriptor sets (set 0 = input samplers, set 1 = UBO), independent of the PBR pipeline layouts.
   - Push constants updated per mesh draw call with model matrix and material index.
-  - Viewport is set dynamically with **negative height**: `y = height`, `height = -height` to preserve Y-up NDC orientation
-  - RenderDoc markers: command buffers are labeled as frame -> main PBR render pass -> per-mesh draw regions. Major resources are named, including swapchain objects, pipeline objects, descriptor objects, UBOs, mesh buffers, textures, sync primitives, and fallback textures.
+  - Viewport is set dynamically with **negative height**: `y = height`, `height = -height` to preserve Y-up NDC orientation. All passes (scene, bright, blur, composite) use the same Y-flip viewport. A shared helper `set_viewport_and_bind_pipeline` in `pass_trait.rs` enforces this.
+  - RenderDoc markers: command buffers are labeled as Frame → Scene Pass (skybox + per-mesh PBR draws) → Bright Pass → Blur Pyramid (16 per-mip labels) → Composite Pass. Major resources are named, including scene color images/views/framebuffers, bloom mip/temp images/views, postprocess pipelines/layouts/descriptor sets/UBO buffers, and bloom framebuffers.
 
 ## Important Patterns
 
@@ -126,15 +152,25 @@ Procedural mesh helpers:
 - **Coordinate system**: Left-handed, Y-up. +Z is forward. `perspective_lh` and `look_to_lh` from glam. No projection Y flip — the flip is done via negative viewport height instead.
 - **Viewport flip**: `vk::Viewport.height` is negative and `y` starts at `extent.height`. This is a y-axis reflection (det = −1) that maps NDC y-down to framebuffer y-up, so authored Y-up content displays Y-up on screen. Per Vulkan 1.3 §28.4, front/back is determined from the signed area in **framebuffer coordinates** (after the viewport transform), so this y-reflection inverts winding once more.
 - **glTF coordinate conversion**: glTF is RH Y-up; the project is LH Y-up. Conversion: negate Z in positions, normals, tangent xyz; flip tangent.w; convert transform matrices via `diag(1,1,-1,1) * M * diag(1,1,-1,1)`. The vertex Z-negate is improper (det = −1) and flips winding from CCW-from-outside (RH) to CW-from-outside (LH world). Combined with the negative-height viewport's second reflection, the two improper transforms cancel and triangles end up **CCW in framebuffer space**, matching `front_face = COUNTER_CLOCKWISE`. See `docs/winding_orientation.md` for the full end-to-end derivation with spec citations.
-- **Descriptor strategy**: Two descriptor sets — set 0 per-frame global UBO (view, proj, camera, light) + material buffer + IBL textures (irradiance, GGX prefilter, BRDF LUT, env cubemap); set 1 per-material textures (5 bindings). No descriptor indexing required.
-- **Shader color output**: `pbr.frag` applies ACES tone mapping and outputs linear color. Do not add manual gamma correction while rendering to the sRGB swapchain attachment; Vulkan performs final linear-to-sRGB encoding on store.
+- **Descriptor strategy**: Two descriptor sets for PBR (set 0 global UBO/material buffer/IBL, set 1 material textures). Postprocess pipelines use their own independent descriptor pools and layouts (set 0 input samplers, set 1 postprocess UBO). No descriptor indexing required.
+- **Shader color output**: `pbr.frag` outputs **linear HDR** radiance (no tonemapping). The composite postprocess pass applies exposure + tonemapping (Linear/Reinhard/ACES) and writes to the sRGB swapchain attachment; Vulkan performs final linear-to-sRGB encoding on store. Do not add tonemapping or gamma correction to PBR or skybox shaders — both belong in the postprocess chain.
+- **Postprocessing framework**: Bloom + tonemapping are implemented as a chain of fullscreen-triangle render passes after the scene pass. Adding a new effect means: write a fragment shader, implement `PostProcessPass`, allocate a framebuffer + descriptor set, insert `.record()` in the command buffer. See `src/vulkan/postprocess/pass_trait.rs` and `docs/postprocessing_plan.md`.
 - **Per-draw data**: Push constants for model matrix + material index (80 B, within 128 B guaranteed minimum).
-- **Cleanup order matters**: `Renderer` must be fully dropped (destroying all device-level objects) before `VulkanContext` drops the device. This is enforced by `ManuallyDrop` in `App`. Inside `Renderer::drop`, scene (meshes, textures, material buffer, fallbacks) and environment map are destroyed first, then UBOs, then descriptor pool/layouts, then fences/semaphores, then command pool, then pipeline/layout/render pass, then swapchain.
+- **Cleanup order matters**: `Renderer` must be fully dropped (destroying all device-level objects) before `VulkanContext` drops the device. This is enforced by `ManuallyDrop` in `App`. Inside `Renderer::drop`, the order is: `device_wait_idle` → postprocess resources (pipelines, render passes, descriptor pool, bloom pyramid, scene color images) → scene → IBL → skybox vertex/index buffers → PBR pipeline/layout → skybox pipeline/layout → global UBOs → main descriptor pool/layouts → fences/semaphores → command pool → swapchain.
 - **Assets**:
   - `assets/models/DamagedHelmet/` is a runtime dependency containing the glTF model and its PBR textures (albedo, normal, metallic-roughness, AO, emissive).
   - `assets/environment_map/ennis/` is a runtime dependency containing the IBL cubemap (KTX2). The renderer reads from this project-relative path via `ENV_BASE_PATH` in `src/vulkan/renderer.rs`. Layout: `lambertian/outputCubeMap.ktx2` (env cubemap), `lambertian/diffuse.ktx2` (irradiance), `ggx/specular.ktx2` (prefilter).
-- **Debug markers**: RenderDoc labels and object names must work in every build configuration. Keep `VK_EXT_debug_utils` enabled independently of validation layers.
+- **Debug markers**: RenderDoc labels and object names must work in every build configuration. Keep `VK_EXT_debug_utils` enabled independently of validation layers. Every pass and every resource must have proper debug markers. Postprocess resources (scene color images, bloom mips/temps, pipelines, descriptor pools, UBOs, framebuffers) are named in `PostProcessResources::name_debug_objects`. Blur passes are labeled individually at each mip level (`"Blur Mip N Horizontal"` / `"Vertical"`).
 - **Validation layers**: active by default in debug builds and enabled in non-debug builds with `--validation` or `--validate`. A clean shutdown produces no validation errors.
 
 # Special notes
 @docs/winding_orientation.md
+
+## Rules
+- Be honest, do not be afraid to ask for help or clarification.
+- Each step must be sound accurate, do not be afraid of complication and complex. Math should be clear and accurate, no vague understanding allowed. If you are confusion, source codes must be read first to clarify. Reference websites or other docs from internet must be authorative, you also must verify that information first before using it. Sound and accurate must be above all.
+- If you need to use python, please use 'uv' instead of directly use python or python3.
+
+## Build, Run & Debug
+- Must at least capture a frame of successfully rendered window to verify the program is running correctly.
+- If the timed running must be done. The counting seconds must start at least one frame rendered successfully. Then at least 16 seconds must pass before stop the program. If you want to ensure the program running, longer running is good.
