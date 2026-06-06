@@ -1,3 +1,5 @@
+#![allow(unsafe_op_in_unsafe_fn)]
+
 use glam::{Mat4, Vec3};
 
 use crate::scene::gltf_loader::{Scene, load_gltf};
@@ -11,7 +13,12 @@ use crate::vulkan::descriptors::{
 use crate::vulkan::ibl::IblResources;
 use crate::vulkan::pbr_ubo::{GlobalUniforms, PushConstants};
 use crate::vulkan::pipeline::{
-    PipelineData, create_pbr_pipeline, create_render_pass, create_skybox_pipeline,
+    PipelineData, create_pbr_pipeline, create_skybox_pipeline,
+};
+use crate::vulkan::postprocess::{
+    BloomPyramid, PostProcessResources,
+    pass_trait::set_viewport_and_bind_pipeline,
+    passes::create_composite_render_pass,
 };
 use crate::vulkan::swapchain::{
     SwapchainData, cleanup_swapchain, create_swapchain, find_depth_format, select_surface_format,
@@ -24,6 +31,7 @@ const RENDER_PASS_LABEL_COLOR: [f32; 4] = [0.2, 0.8, 0.2, 1.0];
 const DRAW_LABEL_COLOR: [f32; 4] = [0.3, 0.5, 1.0, 1.0];
 const SETUP_LABEL_COLOR: [f32; 4] = [0.8, 0.7, 0.2, 1.0];
 const SKYBOX_LABEL_COLOR: [f32; 4] = [0.4, 0.7, 0.9, 1.0];
+const BLUR_LABEL_COLOR: [f32; 4] = [0.6, 0.3, 0.9, 1.0];
 
 const ENV_BASE_PATH: &str = "assets/environment_map/ennis";
 
@@ -52,6 +60,11 @@ pub struct Renderer {
     pub skybox_vertex_buffer: GpuBuffer,
     pub skybox_index_buffer: GpuBuffer,
     pub skybox_index_count: u32,
+    /// Postprocess chain (scene color, bloom, composite).
+    pub postprocess: Option<PostProcessResources>,
+    /// Composite render pass (color-only, PRESENT_SRC_KHR). Owned here so we
+    /// can recreate the swapchain (and pass it to `create_swapchain`).
+    pub composite_render_pass: vk::RenderPass,
 }
 
 impl Renderer {
@@ -61,7 +74,10 @@ impl Renderer {
         let surface_format =
             select_surface_format(&ctx.surface_loader, ctx.physical_device, ctx.surface);
         let depth_format = find_depth_format(&ctx.instance, ctx.physical_device);
-        let render_pass = create_render_pass(&ctx.device, surface_format.format, depth_format);
+        // The composite pass writes the final image to the swapchain via this
+        // color-only render pass.
+        let composite_render_pass =
+            create_composite_render_pass(&ctx.device, surface_format.format);
 
         let swapchain = create_swapchain(
             &ctx.instance,
@@ -72,7 +88,7 @@ impl Renderer {
             ctx.surface,
             window_width,
             window_height,
-            render_pass,
+            composite_render_pass,
             surface_format,
         );
 
@@ -94,10 +110,26 @@ impl Renderer {
         let global_descriptor_set_layout = create_global_descriptor_set_layout(&ctx.device);
         let material_descriptor_set_layout = create_material_descriptor_set_layout(&ctx.device);
 
+        // Create postprocess resources first, so we have the scene render pass
+        // to bind the PBR and skybox pipelines against. This avoids creating
+        // a second (unusable) render pass and ensures the pipelines and the
+        // recorded render pass are compatible.
+        let postprocess = PostProcessResources::new(
+            ctx,
+            command_pool,
+            depth_format,
+            surface_format.format,
+            swapchain.extent,
+            &swapchain.image_views,
+            swapchain.depth_view,
+            MAX_FRAMES_IN_FLIGHT,
+        );
+        let scene_render_pass = postprocess.scene_render_pass;
+
         let push_constant_size = std::mem::size_of::<PushConstants>() as u32;
         let pipeline = create_pbr_pipeline(
             &ctx.device,
-            render_pass,
+            scene_render_pass,
             swapchain.extent,
             global_descriptor_set_layout,
             material_descriptor_set_layout,
@@ -106,7 +138,7 @@ impl Renderer {
 
         let skybox_pipeline = create_skybox_pipeline(
             &ctx.device,
-            render_pass,
+            scene_render_pass,
             swapchain.extent,
             global_descriptor_set_layout,
         );
@@ -372,6 +404,8 @@ impl Renderer {
             skybox_vertex_buffer,
             skybox_index_buffer,
             skybox_index_count,
+            postprocess: Some(postprocess),
+            composite_render_pass,
         };
 
         renderer.name_debug_objects(ctx);
@@ -510,6 +544,10 @@ impl Renderer {
             dm.set_object_name(self.skybox_index_buffer.buffer, "Skybox Index Buffer");
 
             name_swapchain_objects(dm, &self.swapchain);
+
+            if let Some(ref pp) = self.postprocess {
+                pp.name_debug_objects(dm);
+            }
         }
     }
 
@@ -585,7 +623,12 @@ impl Renderer {
         }
 
         let extent = self.swapchain.extent;
-        let framebuffer = self.swapchain.framebuffers[image_index as usize];
+        let postprocess = self.postprocess.as_ref().expect("postprocess must exist");
+        let scene_framebuffer = postprocess.scene_framebuffers[image_index as usize];
+        let composite_framebuffer = self.swapchain.framebuffers[image_index as usize];
+
+        // Update postprocess UBO for this frame.
+        postprocess.update_ubo(frame);
 
         record_command_buffer(
             &ctx.device,
@@ -593,9 +636,10 @@ impl Renderer {
             command_buffer,
             frame,
             image_index,
-            self.pipeline.render_pass,
-            framebuffer,
+            scene_framebuffer,
+            composite_framebuffer,
             extent,
+            postprocess,
             self.pipeline.pipeline,
             self.pipeline.pipeline_layout,
             self.skybox_pipeline.pipeline,
@@ -677,7 +721,7 @@ impl Renderer {
             ctx.surface,
             self.swapchain.extent.width,
             self.swapchain.extent.height,
-            self.pipeline.render_pass,
+            self.composite_render_pass,
             surface_format,
         );
 
@@ -692,6 +736,27 @@ impl Renderer {
         self.render_finished = render_finished;
 
         self.images_in_flight = vec![None; swapchain.images.len()];
+
+        // Recreate postprocess resources: scene color images, bloom pyramid,
+        // and the descriptor sets that point at them. The UBO sets, pipeline
+        // layouts, render passes, and pipeline objects are reused.
+        let depth_format = self.swapchain.depth_format;
+        // Take the old postprocess out so we can destroy it explicitly.
+        let old_pp = self.postprocess.take();
+        if let Some(mut old) = old_pp {
+            unsafe { old.destroy(&self.device); }
+        }
+        self.postprocess = Some(PostProcessResources::new(
+            ctx,
+            self.command_pool,
+            depth_format,
+            self.swapchain.image_format,
+            swapchain.extent,
+            &swapchain.image_views,
+            swapchain.depth_view,
+            MAX_FRAMES_IN_FLIGHT,
+        ));
+
         self.swapchain = swapchain;
 
         if let Some(dm) = ctx.debug_marker.as_ref() {
@@ -786,8 +851,21 @@ impl Drop for Renderer {
             self.device.destroy_pipeline(self.pipeline.pipeline, None);
             self.device
                 .destroy_pipeline_layout(self.pipeline.pipeline_layout, None);
+            // self.pipeline.render_pass is the scene render pass owned by
+            // PostProcessResources. It is destroyed by postprocess.destroy()
+            // below; do not destroy it twice.
+
+            // Destroy the postprocess resources (descriptor pool, pipelines,
+            // scene color images, bloom pyramid, framebuffers, render passes).
+            // They must be destroyed before the device is destroyed, but the
+            // order with respect to the main descriptor pool / pipelines is
+            // independent (we already waited for the device idle at the top
+            // of `drop`).
+            if let Some(mut pp) = self.postprocess.take() {
+                pp.destroy(&self.device);
+            }
             self.device
-                .destroy_render_pass(self.pipeline.render_pass, None);
+                .destroy_render_pass(self.composite_render_pass, None);
 
             cleanup_swapchain(&self.device, &mut self.swapchain);
         }
@@ -800,9 +878,10 @@ fn record_command_buffer(
     command_buffer: vk::CommandBuffer,
     frame: usize,
     image_index: u32,
-    render_pass: vk::RenderPass,
-    framebuffer: vk::Framebuffer,
+    scene_framebuffer: vk::Framebuffer,
+    composite_framebuffer: vk::Framebuffer,
     extent: vk::Extent2D,
+    postprocess: &PostProcessResources,
     pbr_pipeline: vk::Pipeline,
     pbr_pipeline_layout: vk::PipelineLayout,
     skybox_pipeline: vk::Pipeline,
@@ -828,29 +907,11 @@ fn record_command_buffer(
         }
     }
 
-    let clear_values = [
-        vk::ClearValue {
-            color: vk::ClearColorValue {
-                float32: [0.15, 0.15, 0.17, 1.0],
-            },
-        },
-        vk::ClearValue {
-            depth_stencil: vk::ClearDepthStencilValue {
-                depth: 1.0,
-                stencil: 0,
-            },
-        },
-    ];
-
-    let render_pass_begin = vk::RenderPassBeginInfo::default()
-        .render_pass(render_pass)
-        .framebuffer(framebuffer)
-        .render_area(vk::Rect2D {
-            offset: vk::Offset2D { x: 0, y: 0 },
-            extent,
-        })
-        .clear_values(&clear_values);
-
+    // The negative-height viewport is used for every render pass. This is
+    // required by the project's winding contract (see
+    // docs/winding_orientation.md) for the PBR and skybox pipelines, and is
+    // also fine for the postprocess fullscreen-triangle passes (whose
+    // pipelines use cull_mode = NONE).
     let viewport = vk::Viewport::default()
         .x(0.0)
         .y(extent.height as f32)
@@ -863,17 +924,36 @@ fn record_command_buffer(
         .offset(vk::Offset2D { x: 0, y: 0 })
         .extent(extent);
 
+    let scene_clear_values = [
+        vk::ClearValue {
+            color: vk::ClearColorValue {
+                float32: [0.0, 0.0, 0.0, 1.0],
+            },
+        },
+        vk::ClearValue {
+            depth_stencil: vk::ClearDepthStencilValue {
+                depth: 1.0,
+                stencil: 0,
+            },
+        },
+    ];
+
+    let scene_pass_begin = vk::RenderPassBeginInfo::default()
+        .render_pass(postprocess.scene_render_pass)
+        .framebuffer(scene_framebuffer)
+        .render_area(vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent,
+        })
+        .clear_values(&scene_clear_values);
+
     unsafe {
         if let Some(dm) = debug_marker {
-            dm.begin_label(
-                command_buffer,
-                "Main PBR Render Pass",
-                RENDER_PASS_LABEL_COLOR,
-            );
+            dm.begin_label(command_buffer, "Scene Pass", RENDER_PASS_LABEL_COLOR);
         }
         device.cmd_begin_render_pass(
             command_buffer,
-            &render_pass_begin,
+            &scene_pass_begin,
             vk::SubpassContents::INLINE,
         );
         if let Some(dm) = debug_marker {
@@ -1021,8 +1101,305 @@ fn record_command_buffer(
         device.cmd_end_render_pass(command_buffer);
         if let Some(dm) = debug_marker {
             dm.end_label(command_buffer);
+        }
+    }
+
+    // ---- Postprocess passes ----
+    // The scene color attachment was transitioned to SHADER_READ_ONLY_OPTIMAL
+    // at the end of the scene render pass (because the scene render pass
+    // declared that final_layout), so we can sample it directly.
+    unsafe {
+        // Bright pass: scene color -> bloom mip 0.
+        if let Some(dm) = debug_marker {
+            dm.begin_label(command_buffer, "Bright Pass", RENDER_PASS_LABEL_COLOR);
+        }
+        record_bright_pass(
+            device,
+            debug_marker,
+            command_buffer,
+            postprocess,
+            image_index as usize,
+            frame,
+            extent,
+        );
+        if let Some(dm) = debug_marker {
             dm.end_label(command_buffer);
         }
+
+        // Blur passes: per mip, horizontal then vertical (ping-pong).
+        if let Some(dm) = debug_marker {
+            dm.begin_label(command_buffer, "Blur Pyramid", RENDER_PASS_LABEL_COLOR);
+        }
+        record_blur_passes(
+            device,
+            debug_marker,
+            command_buffer,
+            postprocess,
+            frame,
+            extent,
+        );
+        if let Some(dm) = debug_marker {
+            dm.end_label(command_buffer);
+        }
+
+        // Composite: scene + 8 bloom mips + exposure + tonemap -> swapchain.
+        if let Some(dm) = debug_marker {
+            dm.begin_label(command_buffer, "Composite Pass", RENDER_PASS_LABEL_COLOR);
+        }
+        record_composite_pass(
+            device,
+            debug_marker,
+            command_buffer,
+            postprocess,
+            image_index as usize,
+            frame,
+            composite_framebuffer,
+            extent,
+        );
+        if let Some(dm) = debug_marker {
+            dm.end_label(command_buffer);
+        }
+    }
+
+    if let Some(dm) = debug_marker {
+        unsafe { dm.end_label(command_buffer); }
+    }
+    unsafe {
         device.end_command_buffer(command_buffer).unwrap();
+    }
+}
+
+/// Record a single bright-pass render pass. Output is bloom mip 0.
+unsafe fn record_bright_pass(
+    device: &ash::Device,
+    _debug_marker: Option<&DebugMarker>,
+    command_buffer: vk::CommandBuffer,
+    postprocess: &PostProcessResources,
+    image_index: usize,
+    frame: usize,
+    _extent: vk::Extent2D,
+) {
+    let (mip_w, mip_h) = BloomPyramid::mip_extent(postprocess.bloom_extent.0, postprocess.bloom_extent.1, 0);
+    let pass_begin = vk::RenderPassBeginInfo::default()
+        .render_pass(postprocess.postprocess_color_pass)
+        .framebuffer(postprocess.bright_mip0_framebuffer)
+        .render_area(vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: vk::Extent2D {
+                width: mip_w,
+                height: mip_h,
+            },
+        });
+
+    let bright_pipeline = postprocess.bright_pipeline.as_ref().unwrap();
+
+    unsafe {
+        device.cmd_begin_render_pass(command_buffer, &pass_begin, vk::SubpassContents::INLINE);
+        set_viewport_and_bind_pipeline(
+            device,
+            command_buffer,
+            vk::Extent2D {
+                width: mip_w,
+                height: mip_h,
+            },
+            bright_pipeline.pipeline,
+        );
+        // set 0 = scene color sampler; set 1 = postprocess UBO
+        let sets: [vk::DescriptorSet; 2] = [
+            postprocess.bright_input_sets[image_index],
+            postprocess.ubo_sets[frame],
+        ];
+        device.cmd_bind_descriptor_sets(
+            command_buffer,
+            vk::PipelineBindPoint::GRAPHICS,
+            bright_pipeline.pipeline_layout,
+            0,
+            &sets,
+            &[],
+        );
+        device.cmd_draw(command_buffer, 3, 1, 0, 0);
+        device.cmd_end_render_pass(command_buffer);
+    }
+}
+
+/// Record horizontal+vertical Gaussian blurs for each bloom mip, ping-ponging
+/// between the mip image and the temp image. Framebuffers are pre-allocated.
+unsafe fn record_blur_passes(
+    device: &ash::Device,
+    debug_marker: Option<&DebugMarker>,
+    command_buffer: vk::CommandBuffer,
+    postprocess: &PostProcessResources,
+    frame: usize,
+    _extent: vk::Extent2D,
+) {
+    let blur_pipeline = postprocess.blur_pipeline.as_ref().unwrap();
+
+    for level in 0..BloomPyramid::mip_count() {
+        let (mip_w, mip_h) = BloomPyramid::mip_extent(
+            postprocess.bloom_extent.0,
+            postprocess.bloom_extent.1,
+            level,
+        );
+        let mip_extent = vk::Extent2D {
+            width: mip_w,
+            height: mip_h,
+        };
+        let render_area = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: mip_extent,
+        };
+
+        // ---- Horizontal: read from mip[level], write to temp[level]. ----
+        // Use blur_input_sets[2*level] which is pre-bound to mip[level].
+        if let Some(dm) = debug_marker {
+            dm.insert_label(
+                command_buffer,
+                &format!("Blur Mip {} Horizontal", level),
+                BLUR_LABEL_COLOR,
+            );
+        }
+        let pass_begin = vk::RenderPassBeginInfo::default()
+            .render_pass(postprocess.postprocess_color_pass)
+            .framebuffer(postprocess.blur_temp_framebuffers[level])
+            .render_area(render_area);
+        unsafe {
+            device.cmd_begin_render_pass(command_buffer, &pass_begin, vk::SubpassContents::INLINE);
+            set_viewport_and_bind_pipeline(
+                device,
+                command_buffer,
+                mip_extent,
+                blur_pipeline.pipeline,
+            );
+            let sets: [vk::DescriptorSet; 2] = [
+                postprocess.blur_input_sets[2 * level],
+                postprocess.ubo_sets[frame],
+            ];
+            device.cmd_bind_descriptor_sets(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                blur_pipeline.pipeline_layout,
+                0,
+                &sets,
+                &[],
+            );
+            let pc = crate::vulkan::postprocess::BlurPushConstants {
+                texel_size: [1.0 / mip_w as f32, 1.0 / mip_h as f32],
+                direction: 0,
+                _pad: 0,
+            };
+            let pc_bytes = bytemuck::bytes_of(&pc);
+            device.cmd_push_constants(
+                command_buffer,
+                blur_pipeline.pipeline_layout,
+                vk::ShaderStageFlags::FRAGMENT,
+                0,
+                pc_bytes,
+            );
+            device.cmd_draw(command_buffer, 3, 1, 0, 0);
+            device.cmd_end_render_pass(command_buffer);
+        }
+
+        // ---- Vertical: read from temp[level], write to mip[level]. ----
+        // Use blur_input_sets[2*level+1] which is pre-bound to temp[level].
+        if let Some(dm) = debug_marker {
+            dm.insert_label(
+                command_buffer,
+                &format!("Blur Mip {} Vertical", level),
+                BLUR_LABEL_COLOR,
+            );
+        }
+        let pass_begin2 = vk::RenderPassBeginInfo::default()
+            .render_pass(postprocess.postprocess_color_pass)
+            .framebuffer(postprocess.blur_mip_framebuffers[level])
+            .render_area(render_area);
+        unsafe {
+            device.cmd_begin_render_pass(command_buffer, &pass_begin2, vk::SubpassContents::INLINE);
+            set_viewport_and_bind_pipeline(
+                device,
+                command_buffer,
+                mip_extent,
+                blur_pipeline.pipeline,
+            );
+            let sets2: [vk::DescriptorSet; 2] = [
+                postprocess.blur_input_sets[2 * level + 1],
+                postprocess.ubo_sets[frame],
+            ];
+            device.cmd_bind_descriptor_sets(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                blur_pipeline.pipeline_layout,
+                0,
+                &sets2,
+                &[],
+            );
+            let pc2 = crate::vulkan::postprocess::BlurPushConstants {
+                texel_size: [1.0 / mip_w as f32, 1.0 / mip_h as f32],
+                direction: 1,
+                _pad: 0,
+            };
+            let pc_bytes2 = bytemuck::bytes_of(&pc2);
+            device.cmd_push_constants(
+                command_buffer,
+                blur_pipeline.pipeline_layout,
+                vk::ShaderStageFlags::FRAGMENT,
+                0,
+                pc_bytes2,
+            );
+            device.cmd_draw(command_buffer, 3, 1, 0, 0);
+            device.cmd_end_render_pass(command_buffer);
+        }
+    }
+}
+
+/// Record the final composite render pass: scene + 8 bloom mips + exposure +
+/// tonemap -> swapchain. The composite render pass writes the swapchain
+/// attachment in PRESENT_SRC_KHR.
+unsafe fn record_composite_pass(
+    device: &ash::Device,
+    _debug_marker: Option<&DebugMarker>,
+    command_buffer: vk::CommandBuffer,
+    postprocess: &PostProcessResources,
+    image_index: usize,
+    frame: usize,
+    composite_framebuffer: vk::Framebuffer,
+    extent: vk::Extent2D,
+) {
+    let composite_pipeline = postprocess.composite_pipeline.as_ref().unwrap();
+    let clear_values = [vk::ClearValue {
+        color: vk::ClearColorValue {
+            float32: [0.0, 0.0, 0.0, 1.0],
+        },
+    }];
+    let pass_begin = vk::RenderPassBeginInfo::default()
+        .render_pass(postprocess.composite_render_pass)
+        .framebuffer(composite_framebuffer)
+        .render_area(vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent,
+        })
+        .clear_values(&clear_values);
+
+    unsafe {
+        device.cmd_begin_render_pass(command_buffer, &pass_begin, vk::SubpassContents::INLINE);
+        set_viewport_and_bind_pipeline(
+            device,
+            command_buffer,
+            extent,
+            composite_pipeline.pipeline,
+        );
+        let sets: [vk::DescriptorSet; 2] = [
+            postprocess.composite_input_sets[image_index],
+            postprocess.ubo_sets[frame],
+        ];
+        device.cmd_bind_descriptor_sets(
+            command_buffer,
+            vk::PipelineBindPoint::GRAPHICS,
+            composite_pipeline.pipeline_layout,
+            0,
+            &sets,
+            &[],
+        );
+        device.cmd_draw(command_buffer, 3, 1, 0, 0);
+        device.cmd_end_render_pass(command_buffer);
     }
 }
