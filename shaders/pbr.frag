@@ -82,15 +82,6 @@ vec3 fresnelSchlickRoughness(float cosTheta, vec3 F0, float roughness) {
             * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
 }
 
-vec3 acesToneMapping(vec3 color) {
-    float a = 2.51;
-    float b = 0.03;
-    float c = 2.43;
-    float d = 0.59;
-    float e = 0.14;
-    return clamp((color * (a * color + b)) / (color * (c * color + d) + e), 0.0, 1.0);
-}
-
 void main() {
     Material mat = materialBuffer.materials[pc.materialIndex];
 
@@ -159,8 +150,8 @@ void main() {
 
     vec3 color = ambient + Lo + emissive;
 
-    // Tone map to linear color. The sRGB swapchain attachment performs final encoding.
-    color = acesToneMapping(color);
-
+    // Output linear HDR. The postprocess composite pass applies exposure and
+    // tonemapping, then writes to the sRGB swapchain which performs final
+    // linear->sRGB encoding on store.
     outColor = vec4(color, alpha);
 }
