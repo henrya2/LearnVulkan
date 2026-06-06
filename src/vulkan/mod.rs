@@ -1,8 +1,11 @@
+pub mod brdf_lut;
 pub mod buffer;
 pub mod context;
+pub mod cubemap;
 pub mod debug_marker;
 pub mod descriptors;
-pub mod environment_map;
+pub mod ibl;
+pub mod ktx2_loader;
 pub mod pbr_ubo;
 pub mod pipeline;
 pub mod renderer;

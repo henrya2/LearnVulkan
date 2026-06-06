@@ -29,7 +29,9 @@ layout(set = 1, binding = 2) uniform sampler2D uNormal;
 layout(set = 1, binding = 3) uniform sampler2D uOcclusion;
 layout(set = 1, binding = 4) uniform sampler2D uEmissive;
 
-layout(set = 0, binding = 2) uniform sampler2D uEnvironmentMap;
+layout(set = 0, binding = 2) uniform samplerCube uIrradianceMap;
+layout(set = 0, binding = 3) uniform samplerCube uPrefilterMap;
+layout(set = 0, binding = 4) uniform sampler2D uBRDFLUT;
 
 layout(push_constant) uniform PushConstants {
     mat4 model;
@@ -89,13 +91,6 @@ vec3 acesToneMapping(vec3 color) {
     return clamp((color * (a * color + b)) / (color * (c * color + d) + e), 0.0, 1.0);
 }
 
-vec2 sampleSphericalMap(vec3 v) {
-    vec2 uv = vec2(atan(v.z, v.x), asin(v.y));
-    uv *= vec2(0.1591, 0.3183);
-    uv += 0.5;
-    return uv;
-}
-
 void main() {
     Material mat = materialBuffer.materials[pc.materialIndex];
 
@@ -145,23 +140,22 @@ void main() {
     vec3 lightColor = vec3(1.0, 0.98, 0.95);
     vec3 Lo = (kD * baseColor / PI + specular) * NdotL * globals.lightIntensity * lightColor;
 
-    // Simplified IBL
-    vec3 R = reflect(-V, N);
-    vec2 envUV_diffuse = sampleSphericalMap(N);
-    vec2 envUV_specular = sampleSphericalMap(R);
-
-    float MAX_REFLECTION_LOD = 8.0;
-    vec3 diffuse_ibl = textureLod(uEnvironmentMap, envUV_diffuse, MAX_REFLECTION_LOD * 0.75).rgb;
-    vec3 specular_ibl = textureLod(uEnvironmentMap, envUV_specular, roughness * MAX_REFLECTION_LOD).rgb;
-
+    // Split-sum IBL
     vec3 F_ambient = fresnelSchlickRoughness(NdotV, F0, roughness);
-    vec3 kS_ambient = F_ambient;
-    vec3 kD_ambient = (vec3(1.0) - kS_ambient) * (1.0 - metallic);
+    vec3 kD_ambient = (vec3(1.0) - F_ambient) * (1.0 - metallic);
 
-    vec3 diffuse_env = diffuse_ibl * kD_ambient * baseColor * 1.5;
-    vec3 specular_env = specular_ibl * kS_ambient * 1.5;
+    // Diffuse IBL
+    vec3 irradiance = texture(uIrradianceMap, N).rgb;
+    vec3 diffuse_ibl = irradiance * kD_ambient * baseColor;
 
-    vec3 ambient = diffuse_env * occlusion + specular_env;
+    // Specular IBL
+    vec3 R = reflect(-V, N);
+    const float MAX_PREFILTER_LOD = 10.0; // prefilter_map has 11 mip levels (0..10)
+    vec3 prefilteredColor = textureLod(uPrefilterMap, R, roughness * MAX_PREFILTER_LOD).rgb;
+    vec2 brdf = texture(uBRDFLUT, vec2(NdotV, roughness)).rg;
+    vec3 specular_ibl = prefilteredColor * (F_ambient * brdf.x + brdf.y);
+
+    vec3 ambient = (diffuse_ibl + specular_ibl) * occlusion;
 
     vec3 color = ambient + Lo + emissive;
 

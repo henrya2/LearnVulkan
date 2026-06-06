@@ -1,16 +1,18 @@
 use glam::{Mat4, Vec3};
 
 use crate::scene::gltf_loader::{Scene, load_gltf};
-use crate::vulkan::buffer::{GpuBuffer, create_buffer};
+use crate::vulkan::buffer::{GpuBuffer, create_buffer, create_device_local_buffer};
 use crate::vulkan::context::VulkanContext;
 use crate::vulkan::debug_marker::DebugMarker;
 use crate::vulkan::descriptors::{
     create_descriptor_pool, create_global_descriptor_set_layout,
     create_material_descriptor_set_layout,
 };
-use crate::vulkan::environment_map::create_synthetic_environment_map;
+use crate::vulkan::ibl::IblResources;
 use crate::vulkan::pbr_ubo::{GlobalUniforms, PushConstants};
-use crate::vulkan::pipeline::{PipelineData, create_pbr_pipeline, create_render_pass};
+use crate::vulkan::pipeline::{
+    PipelineData, create_pbr_pipeline, create_render_pass, create_skybox_pipeline,
+};
 use crate::vulkan::swapchain::{
     SwapchainData, cleanup_swapchain, create_swapchain, find_depth_format, select_surface_format,
 };
@@ -21,11 +23,15 @@ const FRAME_LABEL_COLOR: [f32; 4] = [0.3, 0.3, 0.3, 1.0];
 const RENDER_PASS_LABEL_COLOR: [f32; 4] = [0.2, 0.8, 0.2, 1.0];
 const DRAW_LABEL_COLOR: [f32; 4] = [0.3, 0.5, 1.0, 1.0];
 const SETUP_LABEL_COLOR: [f32; 4] = [0.8, 0.7, 0.2, 1.0];
+const SKYBOX_LABEL_COLOR: [f32; 4] = [0.4, 0.7, 0.9, 1.0];
+
+const ENV_BASE_PATH: &str = "assets/environment_map/ennis";
 
 pub struct Renderer {
     pub device: ash::Device,
     pub swapchain: SwapchainData,
     pub pipeline: PipelineData,
+    pub skybox_pipeline: PipelineData,
     pub command_pool: vk::CommandPool,
     pub command_buffers: Vec<vk::CommandBuffer>,
     pub image_available: Vec<vk::Semaphore>,
@@ -42,7 +48,10 @@ pub struct Renderer {
     pub descriptor_pool: vk::DescriptorPool,
     pub global_descriptor_sets: Vec<vk::DescriptorSet>,
     pub material_descriptor_sets: Vec<vk::DescriptorSet>,
-    pub env_map: crate::vulkan::texture::Texture,
+    pub ibl: IblResources,
+    pub skybox_vertex_buffer: GpuBuffer,
+    pub skybox_index_buffer: GpuBuffer,
+    pub skybox_index_count: u32,
 }
 
 impl Renderer {
@@ -80,6 +89,8 @@ impl Renderer {
             "assets/models/DamagedHelmet/DamagedHelmet.gltf",
         );
 
+        let ibl = IblResources::load(ctx, command_pool, ENV_BASE_PATH);
+
         let global_descriptor_set_layout = create_global_descriptor_set_layout(&ctx.device);
         let material_descriptor_set_layout = create_material_descriptor_set_layout(&ctx.device);
 
@@ -91,6 +102,13 @@ impl Renderer {
             global_descriptor_set_layout,
             material_descriptor_set_layout,
             push_constant_size,
+        );
+
+        let skybox_pipeline = create_skybox_pipeline(
+            &ctx.device,
+            render_pass,
+            swapchain.extent,
+            global_descriptor_set_layout,
         );
 
         let ubo_size = std::mem::size_of::<GlobalUniforms>() as vk::DeviceSize;
@@ -116,8 +134,6 @@ impl Renderer {
 
         let descriptor_pool = create_descriptor_pool(&ctx.device, scene.materials.len() as u32);
 
-        let env_map = create_synthetic_environment_map(ctx, command_pool);
-
         let global_descriptor_sets = {
             let layouts = vec![global_descriptor_set_layout; MAX_FRAMES_IN_FLIGHT];
             let alloc_info = vk::DescriptorSetAllocateInfo::default()
@@ -135,10 +151,22 @@ impl Renderer {
                 .buffer(scene.material_buffer.buffer)
                 .offset(0)
                 .range(scene.material_buffer.size);
-            let env_map_info = vk::DescriptorImageInfo::default()
+            let irradiance_info = vk::DescriptorImageInfo::default()
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .image_view(env_map.view)
-                .sampler(env_map.sampler);
+                .image_view(ibl.irradiance_map.view)
+                .sampler(ibl.irradiance_map.sampler);
+            let prefilter_info = vk::DescriptorImageInfo::default()
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .image_view(ibl.prefilter_map.view)
+                .sampler(ibl.prefilter_map.sampler);
+            let brdf_lut_info = vk::DescriptorImageInfo::default()
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .image_view(ibl.brdf_lut.view)
+                .sampler(ibl.brdf_lut.sampler);
+            let env_cubemap_info = vk::DescriptorImageInfo::default()
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .image_view(ibl.env_cubemap.view)
+                .sampler(ibl.env_cubemap.sampler);
 
             let writes = [
                 vk::WriteDescriptorSet::default()
@@ -158,7 +186,25 @@ impl Renderer {
                     .dst_binding(2)
                     .dst_array_element(0)
                     .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                    .image_info(std::slice::from_ref(&env_map_info)),
+                    .image_info(std::slice::from_ref(&irradiance_info)),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(global_descriptor_sets[i])
+                    .dst_binding(3)
+                    .dst_array_element(0)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(std::slice::from_ref(&prefilter_info)),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(global_descriptor_sets[i])
+                    .dst_binding(4)
+                    .dst_array_element(0)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(std::slice::from_ref(&brdf_lut_info)),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(global_descriptor_sets[i])
+                    .dst_binding(5)
+                    .dst_array_element(0)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(std::slice::from_ref(&env_cubemap_info)),
             ];
             unsafe { ctx.device.update_descriptor_sets(&writes, &[]) };
         }
@@ -230,6 +276,40 @@ impl Renderer {
             unsafe { ctx.device.update_descriptor_sets(&writes, &[]) };
         }
 
+        // Skybox cube geometry (positions only)
+        let skybox_vertices: [[f32; 3]; 8] = [
+            [-1.0, -1.0, -1.0],
+            [1.0, -1.0, -1.0],
+            [1.0, 1.0, -1.0],
+            [-1.0, 1.0, -1.0],
+            [-1.0, -1.0, 1.0],
+            [1.0, -1.0, 1.0],
+            [1.0, 1.0, 1.0],
+            [-1.0, 1.0, 1.0],
+        ];
+        let skybox_indices: [u32; 36] = [
+            // Front
+            4, 5, 6, 4, 6, 7, // Back
+            1, 0, 3, 1, 3, 2, // Top
+            3, 7, 6, 3, 6, 2, // Bottom
+            0, 1, 5, 0, 5, 4, // Right
+            1, 2, 6, 1, 6, 5, // Left
+            0, 4, 7, 0, 7, 3,
+        ];
+        let skybox_index_count = skybox_indices.len() as u32;
+        let skybox_vertex_buffer = create_device_local_buffer(
+            ctx,
+            command_pool,
+            &skybox_vertices,
+            vk::BufferUsageFlags::VERTEX_BUFFER,
+        );
+        let skybox_index_buffer = create_device_local_buffer(
+            ctx,
+            command_pool,
+            &skybox_indices,
+            vk::BufferUsageFlags::INDEX_BUFFER,
+        );
+
         let command_buffers = {
             let alloc_info = vk::CommandBufferAllocateInfo::default()
                 .command_pool(command_pool)
@@ -271,6 +351,7 @@ impl Renderer {
             device: ctx.device.clone(),
             swapchain,
             pipeline,
+            skybox_pipeline,
             command_pool,
             command_buffers,
             image_available,
@@ -287,7 +368,10 @@ impl Renderer {
             descriptor_pool,
             global_descriptor_sets,
             material_descriptor_sets,
-            env_map,
+            ibl,
+            skybox_vertex_buffer,
+            skybox_index_buffer,
+            skybox_index_count,
         };
 
         renderer.name_debug_objects(ctx);
@@ -303,6 +387,11 @@ impl Renderer {
             dm.set_object_name(self.pipeline.render_pass, "Main PBR Render Pass");
             dm.set_object_name(self.pipeline.pipeline_layout, "PBR Pipeline Layout");
             dm.set_object_name(self.pipeline.pipeline, "PBR Graphics Pipeline");
+            dm.set_object_name(
+                self.skybox_pipeline.pipeline_layout,
+                "Skybox Pipeline Layout",
+            );
+            dm.set_object_name(self.skybox_pipeline.pipeline, "Skybox Graphics Pipeline");
             dm.set_object_name(self.command_pool, "Main Graphics Command Pool");
             dm.set_object_name(
                 self.global_descriptor_set_layout,
@@ -380,7 +469,45 @@ impl Renderer {
                 &self.scene.fallback_textures.metallic_roughness_linear,
                 "Fallback Metallic-Roughness Linear Texture",
             );
-            name_texture(dm, &self.env_map, "Synthetic Environment Map");
+
+            // IBL resources
+            dm.set_object_name(
+                self.ibl.env_cubemap.image,
+                "Ennis Environment Cubemap Image",
+            );
+            dm.set_object_name(self.ibl.env_cubemap.view, "Ennis Environment Cubemap View");
+            dm.set_object_name(
+                self.ibl.env_cubemap.sampler,
+                "Ennis Environment Cubemap Sampler",
+            );
+            dm.set_object_name(
+                self.ibl.irradiance_map.image,
+                "Ennis Irradiance Cubemap Image",
+            );
+            dm.set_object_name(
+                self.ibl.irradiance_map.view,
+                "Ennis Irradiance Cubemap View",
+            );
+            dm.set_object_name(
+                self.ibl.irradiance_map.sampler,
+                "Ennis Irradiance Cubemap Sampler",
+            );
+            dm.set_object_name(
+                self.ibl.prefilter_map.image,
+                "Ennis Prefilter Cubemap Image",
+            );
+            dm.set_object_name(self.ibl.prefilter_map.view, "Ennis Prefilter Cubemap View");
+            dm.set_object_name(
+                self.ibl.prefilter_map.sampler,
+                "Ennis Prefilter Cubemap Sampler",
+            );
+            dm.set_object_name(self.ibl.brdf_lut.image, "BRDF LUT Image");
+            dm.set_object_name(self.ibl.brdf_lut.view, "BRDF LUT View");
+            dm.set_object_name(self.ibl.brdf_lut.sampler, "BRDF LUT Sampler");
+
+            // Skybox
+            dm.set_object_name(self.skybox_vertex_buffer.buffer, "Skybox Vertex Buffer");
+            dm.set_object_name(self.skybox_index_buffer.buffer, "Skybox Index Buffer");
 
             name_swapchain_objects(dm, &self.swapchain);
         }
@@ -471,9 +598,14 @@ impl Renderer {
             extent,
             self.pipeline.pipeline,
             self.pipeline.pipeline_layout,
+            self.skybox_pipeline.pipeline,
+            self.skybox_pipeline.pipeline_layout,
             self.global_descriptor_sets[frame],
             &self.material_descriptor_sets,
             &self.scene,
+            self.skybox_vertex_buffer.buffer,
+            self.skybox_index_buffer.buffer,
+            self.skybox_index_count,
         );
 
         let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
@@ -610,7 +742,15 @@ impl Drop for Renderer {
 
             self.scene.destroy(&self.device);
 
-            self.env_map.destroy(&self.device);
+            self.ibl.destroy(&self.device);
+
+            self.skybox_vertex_buffer.destroy(&self.device);
+            self.skybox_index_buffer.destroy(&self.device);
+
+            self.device
+                .destroy_pipeline(self.skybox_pipeline.pipeline, None);
+            self.device
+                .destroy_pipeline_layout(self.skybox_pipeline.pipeline_layout, None);
 
             for (ub, mapped) in self
                 .global_uniforms
@@ -663,11 +803,16 @@ fn record_command_buffer(
     render_pass: vk::RenderPass,
     framebuffer: vk::Framebuffer,
     extent: vk::Extent2D,
-    pipeline: vk::Pipeline,
-    pipeline_layout: vk::PipelineLayout,
+    pbr_pipeline: vk::Pipeline,
+    pbr_pipeline_layout: vk::PipelineLayout,
+    skybox_pipeline: vk::Pipeline,
+    skybox_pipeline_layout: vk::PipelineLayout,
     global_descriptor_set: vk::DescriptorSet,
     material_descriptor_sets: &[vk::DescriptorSet],
     scene: &Scene,
+    skybox_vertex_buffer: vk::Buffer,
+    skybox_index_buffer: vk::Buffer,
+    skybox_index_count: u32,
 ) {
     let begin_info = vk::CommandBufferBeginInfo::default();
     unsafe {
@@ -740,10 +885,50 @@ fn record_command_buffer(
         }
         device.cmd_set_viewport(command_buffer, 0, std::slice::from_ref(&viewport));
         device.cmd_set_scissor(command_buffer, 0, std::slice::from_ref(&scissor));
+
+        // ---- Draw skybox first ----
+        if let Some(dm) = debug_marker {
+            dm.begin_label(command_buffer, "Draw Skybox", SKYBOX_LABEL_COLOR);
+        }
+        device.cmd_bind_pipeline(
+            command_buffer,
+            vk::PipelineBindPoint::GRAPHICS,
+            skybox_pipeline,
+        );
+        device.cmd_bind_descriptor_sets(
+            command_buffer,
+            vk::PipelineBindPoint::GRAPHICS,
+            skybox_pipeline_layout,
+            0,
+            std::slice::from_ref(&global_descriptor_set),
+            &[],
+        );
+        device.cmd_bind_vertex_buffers(
+            command_buffer,
+            0,
+            std::slice::from_ref(&skybox_vertex_buffer),
+            &[0],
+        );
+        device.cmd_bind_index_buffer(
+            command_buffer,
+            skybox_index_buffer,
+            0,
+            vk::IndexType::UINT32,
+        );
+        device.cmd_draw_indexed(command_buffer, skybox_index_count, 1, 0, 0, 0);
+        if let Some(dm) = debug_marker {
+            dm.end_label(command_buffer);
+        }
+
+        // ---- Draw PBR geometry ----
         if let Some(dm) = debug_marker {
             dm.insert_label(command_buffer, "Bind PBR Pipeline", SETUP_LABEL_COLOR);
         }
-        device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
+        device.cmd_bind_pipeline(
+            command_buffer,
+            vk::PipelineBindPoint::GRAPHICS,
+            pbr_pipeline,
+        );
 
         if let Some(dm) = debug_marker {
             dm.insert_label(command_buffer, "Bind Global Descriptors", SETUP_LABEL_COLOR);
@@ -751,7 +936,7 @@ fn record_command_buffer(
         device.cmd_bind_descriptor_sets(
             command_buffer,
             vk::PipelineBindPoint::GRAPHICS,
-            pipeline_layout,
+            pbr_pipeline_layout,
             0,
             std::slice::from_ref(&global_descriptor_set),
             &[],
@@ -785,7 +970,7 @@ fn record_command_buffer(
             }
             device.cmd_push_constants(
                 command_buffer,
-                pipeline_layout,
+                pbr_pipeline_layout,
                 vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
                 0,
                 pc_bytes,
@@ -801,7 +986,7 @@ fn record_command_buffer(
             device.cmd_bind_descriptor_sets(
                 command_buffer,
                 vk::PipelineBindPoint::GRAPHICS,
-                pipeline_layout,
+                pbr_pipeline_layout,
                 1,
                 std::slice::from_ref(&material_descriptor_sets[mesh.material_index]),
                 &[],
