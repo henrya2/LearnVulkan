@@ -137,7 +137,7 @@ LearnVulkan/
             ├── pyramid.rs      # BloomPyramid: 2 images x 8 mips (R16G16B16A16_SFLOAT)
             ├── descriptors.rs  # Postprocess descriptor set layouts: UBO, single-input, composite-input
             ├── fullscreen.rs   # Fullscreen-triangle pipeline builder
-            └── pass_trait.rs   # PostProcessPass trait + shared viewport/scissor helper
+            └── pass_trait.rs   # Shared viewport/scissor helper
 ```
 
 ## Architecture Highlights
@@ -148,22 +148,22 @@ LearnVulkan/
 - **glTF scene loading:** loads the default scene, or scene 0 if no default is declared. Primitives without explicit materials use an explicit glTF default material.
 - **Descriptor strategy:** Two descriptor sets — set 0 (per-frame): global UBO (view/proj/camera/light) + material buffer + IBL textures (irradiance, GGX prefilter, BRDF LUT, env cubemap); set 1 (per-material): 5 combined image samplers (base_color, metallic_roughness, normal, occlusion, emissive). No descriptor indexing required.
 - **IBL assets:** the renderer reads Ennis KTX2 cubemaps from `assets/environment_map/ennis/` via the `ENV_BASE_PATH` constant in `src/vulkan/renderer.rs` (`lambertian/outputCubeMap.ktx2` for the skybox, `lambertian/diffuse.ktx2` for irradiance, `ggx/specular.ktx2` for the prefiltered specular). The BRDF LUT is generated procedurally on the GPU at startup.
-- **Per-frame UBOs:** one `HOST_VISIBLE | HOST_COHERENT` buffer per in-flight frame (160 B), persistently mapped. Written after fence wait, before submit.
+- **Per-frame UBOs:** one `HOST_VISIBLE | HOST_COHERENT` buffer per in-flight frame (176 B), persistently mapped. Written after fence wait, before submit.
 - **Per-draw push constants:** model matrix (64 B) + material index (4 B) + padding (12 B) = 80 B, within the 128 B guaranteed minimum.
 - **Texture upload:** staging buffer -> device-local `vk::Image` via `cmd_copy_buffer_to_image` for mip level 0. Runtime mipmaps are generated on the GPU via `vk::CmdBlitImage`. `Texture::from_rgba8_with_format` takes the Vulkan format explicitly. glTF base-color/emissive textures use `R8G8B8A8_SRGB`; normal, metallic-roughness, and occlusion textures use `R8G8B8A8_UNORM`.
-- **Shader output color:** `pbr.frag` and `skybox.frag` output **linear HDR** radiance (no tonemapping or gamma correction). The postprocess composite pass applies exposure + tonemapping (Linear/Reinhard/ACES) and writes to the sRGB swapchain attachment; Vulkan performs final linear-to-sRGB encoding on store. Tonemapping and gamma correction belong exclusively in the postprocess chain.
+- **Shader output color:** `pbr.frag` and `skybox.frag` output **linear HDR** (no tonemapping or gamma correction). The postprocess composite pass applies exposure + tonemapping (Linear/Reinhard/ACES) and writes to the sRGB swapchain attachment; Vulkan performs final linear-to-sRGB encoding on store. Tonemapping and gamma correction belong exclusively in the postprocess chain.
 - **Postprocessing framework:** A chain of fullscreen-triangle render passes executing after the scene pass, within the same command buffer:
   1. **Scene render pass** — PBR + skybox to HDR `R16G16B16A16_SFLOAT` scene color (with depth)
-  2. **Bright pass** — Soft-knee highlight extraction -> bloom mip 0
-  3. **Blur passes** — 16 render passes (8 horizontal + 8 vertical) for separable Gaussian downsampling across 8 bloom mips
+  2. **Bloom Prefilter** — Soft-knee highlight extraction -> bloom mip 0
+  3. **Bloom Pyramid** — 16 render passes (8 horizontal + 8 vertical) for separable Gaussian downsampling across 8 bloom mips
   4. **Composite pass** — Scene color + 8 bloom mips -> `pow(2, exposure)` -> tonemap (Linear/Reinhard/ACES) -> sRGB swapchain
   - Postprocess pipelines use `cull_mode = NONE` (fullscreen triangle is CW under Y-flip viewport).
-  - Descriptor sets: set 0 = input samplers (1 for bright/blur, 9 for composite), set 1 = postprocess UBO (exposure, bloom parameters, tonemap operator).
-  - Adding a new effect: implement `PostProcessPass` trait, allocate framebuffer + descriptor sets, insert `.record()` in the command buffer.
+  - Descriptor sets: set 0 = input samplers (1 for bloom prefilter/blur, 9 for composite), set 1 = postprocess UBO (exposure, bloom parameters, tonemap operator).
+  - Adding a new effect: allocate framebuffer + descriptor sets, insert render pass calls in the command buffer.
 - **Skybox:** Unit cube rendered with `LESS_OR_EQUAL` depth test and depth writes disabled, so it only appears where no geometry is drawn. The skybox shader strips view translation (`mat3(view)`) to keep the environment infinitely distant. Share the same `front_face = COUNTER_CLOCKWISE` / `cull_mode = BACK` as PBR; the camera-on-inside produces CCW-in-framebuffer windings (one Y-flip viewport reflection). See `docs/winding_orientation.md` §§S1-S8 for the full derivation.
 - **Cleanup order:** `Renderer` is dropped before `VulkanContext` via `ManuallyDrop`. Inside the renderer: `device_wait_idle` -> scene -> IBL -> skybox buffers -> skybox pipeline -> global UBOs -> main descriptor pool/layouts -> fences/semaphores -> command pool -> PBR pipeline -> postprocess resources (pipelines, render passes, descriptor pool, bloom pyramid, scene color images) -> swapchain.
 - **Sync strategy:** `MAX_FRAMES_IN_FLIGHT = 2`. `render_finished` semaphores are per-swapchain-image to avoid reuse validation errors.
-- **RenderDoc debug markers:** `VK_EXT_debug_utils` is enabled in all builds. Command buffers contain frame/render-pass/per-mesh label regions, and major Vulkan objects are named for RenderDoc resource inspection.
+- **RenderDoc debug markers:** `VK_EXT_debug_utils` is enabled in all builds. Command buffers contain frame/render-pass/per-mesh label regions (Scene Pass → PostProcessing group containing Bloom Prefilter, Bloom Pyramid, and Composite Pass), and major Vulkan objects are named for RenderDoc resource inspection.
 - **Validation layers:** `VK_LAYER_KHRONOS_validation` is enabled by default in debug builds. In non-debug builds, launch with `--validation` or `--validate` to enable it.
 
 ## License
