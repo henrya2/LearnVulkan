@@ -1,7 +1,6 @@
 use ash::vk;
 
 pub struct PipelineData {
-    pub render_pass: vk::RenderPass,
     pub pipeline_layout: vk::PipelineLayout,
     pub pipeline: vk::Pipeline,
 }
@@ -20,7 +19,6 @@ fn create_shader_module(device: &ash::Device, code: &[u8]) -> vk::ShaderModule {
 pub fn create_pbr_pipeline(
     device: &ash::Device,
     render_pass: vk::RenderPass,
-    _extent: vk::Extent2D,
     global_layout: vk::DescriptorSetLayout,
     material_layout: vk::DescriptorSetLayout,
     push_constant_size: u32,
@@ -139,7 +137,6 @@ pub fn create_pbr_pipeline(
     }
 
     PipelineData {
-        render_pass,
         pipeline_layout,
         pipeline,
     }
@@ -148,7 +145,6 @@ pub fn create_pbr_pipeline(
 pub fn create_skybox_pipeline(
     device: &ash::Device,
     render_pass: vk::RenderPass,
-    _extent: vk::Extent2D,
     global_layout: vk::DescriptorSetLayout,
 ) -> PipelineData {
     let vert_code = include_bytes!("../../shaders/skybox.vert.spv");
@@ -270,7 +266,6 @@ pub fn create_skybox_pipeline(
     }
 
     PipelineData {
-        render_pass,
         pipeline_layout,
         pipeline,
     }

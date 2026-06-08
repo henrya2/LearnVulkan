@@ -14,7 +14,6 @@ use crate::vulkan::pipeline::PipelineData;
 pub fn create_fullscreen_pipeline(
     device: &ash::Device,
     render_pass: vk::RenderPass,
-    extent: vk::Extent2D,
     pipeline_layout: vk::PipelineLayout,
     frag_code: &[u8],
 ) -> PipelineData {
@@ -82,7 +81,6 @@ pub fn create_fullscreen_pipeline(
         .logic_op_enable(false)
         .attachments(std::slice::from_ref(&color_blend_attachment));
 
-    let _ = extent;
     let create_info = vk::GraphicsPipelineCreateInfo::default()
         .stages(&stages)
         .vertex_input_state(&vertex_input)
@@ -113,7 +111,6 @@ pub fn create_fullscreen_pipeline(
     }
 
     PipelineData {
-        render_pass,
         pipeline_layout,
         pipeline,
     }

@@ -9,6 +9,11 @@ pub struct GlobalUniforms {
     pub _pad0: f32,
     pub light_dir: [f32; 3],
     pub light_intensity: f32,
+    /// Highest valid mip index for the prefilter cubemap, i.e.
+    /// `prefilter.mip_levels - 1`. The PBR fragment shader maps roughness
+    /// into the prefilter chain via `roughness * prefilter_max_lod`.
+    pub prefilter_max_lod: f32,
+    pub _pad1: [f32; 3],
 }
 
 #[repr(C)]

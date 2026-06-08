@@ -110,6 +110,13 @@ pub fn load_gltf(ctx: &VulkanContext, command_pool: vk::CommandPool, path: &str)
         });
     }
 
+    // Ensure we always have at least one material. This guards against
+    // 0-byte buffer creation and empty descriptor-set allocations on
+    // glTF files that declare no materials.
+    if materials.is_empty() {
+        materials.push(PbrMaterial::default_gltf());
+    }
+
     let mut default_material_index = None;
 
     // Build scene graph and compute world transforms for the active scene only.

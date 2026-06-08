@@ -17,7 +17,7 @@ pub struct VulkanContext {
     #[allow(dead_code)]
     pub present_family: u32,
     pub debug_utils: Option<DebugUtils>,
-    pub debug_marker: Option<DebugMarker>,
+    pub debug_marker: DebugMarker,
 }
 
 pub struct DebugUtils {
@@ -48,7 +48,7 @@ impl VulkanContext {
         let (device, graphics_queue, present_queue) =
             create_logical_device(&instance, physical_device, graphics_family, present_family);
 
-        let debug_marker = Some(DebugMarker::new(&instance, &device));
+        let debug_marker = DebugMarker::new(&instance, &device);
 
         Self {
             entry,

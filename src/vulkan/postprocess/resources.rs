@@ -10,7 +10,7 @@ use crate::vulkan::postprocess::descriptors::{
 };
 use crate::vulkan::postprocess::fullscreen::create_fullscreen_pipeline;
 use crate::vulkan::postprocess::passes::{
-    create_composite_render_pass, create_postprocess_color_pass, create_scene_render_pass,
+    create_postprocess_color_pass, create_scene_render_pass,
 };
 use crate::vulkan::postprocess::pyramid::{BLOOM_FORMAT, BLOOM_MIP_COUNT, BloomPyramid};
 use crate::vulkan::postprocess::ubo::PostProcessUBO;
@@ -54,6 +54,8 @@ pub struct PostProcessResources {
     // Render passes
     pub scene_render_pass: vk::RenderPass,
     pub postprocess_color_pass: vk::RenderPass, // reused for bright + blur
+    /// Composite render pass — owned by the renderer (so it can outlive
+    /// resource recreation on swapchain resize). We just hold the handle.
     pub composite_render_pass: vk::RenderPass,
 
     // Scene color (per swapchain image)
@@ -105,6 +107,10 @@ pub struct PostProcessResources {
 impl PostProcessResources {
     /// Construct postprocess resources. Must be called after the swapchain has
     /// been created (so we know the swapchain image count and the depth format).
+    ///
+    /// `composite_render_pass` is owned by the caller (the `Renderer`) and is
+    /// shared between the swapchain framebuffers and the composite pipeline.
+    /// `PostProcessResources` does not destroy it.
     pub fn new(
         ctx: &VulkanContext,
         command_pool: vk::CommandPool,
@@ -114,14 +120,15 @@ impl PostProcessResources {
         swapchain_image_views: &[vk::ImageView],
         depth_view: vk::ImageView,
         max_frames_in_flight: usize,
+        composite_render_pass: vk::RenderPass,
     ) -> Self {
+        let _ = swapchain_format;
         let device = &ctx.device;
         let num_swapchain_images = swapchain_image_views.len();
 
         // --- Render passes ---
         let scene_render_pass = create_scene_render_pass(device, BLOOM_FORMAT, depth_format);
         let postprocess_color_pass = create_postprocess_color_pass(device, BLOOM_FORMAT);
-        let composite_render_pass = create_composite_render_pass(device, swapchain_format);
 
         // --- Scene color images / views / memories ---
         let mut scene_images = Vec::with_capacity(num_swapchain_images);
@@ -350,21 +357,18 @@ impl PostProcessResources {
         let bright_pipeline = Some(create_fullscreen_pipeline(
             device,
             postprocess_color_pass,
-            swapchain_extent,
             bright_pipeline_layout,
             bright_frag,
         ));
         let blur_pipeline = Some(create_fullscreen_pipeline(
             device,
             postprocess_color_pass,
-            swapchain_extent,
             blur_pipeline_layout,
             blur_frag,
         ));
         let composite_pipeline = Some(create_fullscreen_pipeline(
             device,
             composite_render_pass,
-            swapchain_extent,
             composite_pipeline_layout,
             composite_frag,
         ));
@@ -607,15 +611,11 @@ impl PostProcessResources {
     /// unsupported extensions are no-ops.
     pub fn name_debug_objects(&self, dm: &DebugMarker) {
         unsafe {
-            // Render passes
+            // Render passes (composite is owned by the renderer and named there)
             dm.set_object_name(self.scene_render_pass, "Scene HDR Render Pass");
             dm.set_object_name(
                 self.postprocess_color_pass,
                 "Postprocess Color Render Pass",
-            );
-            dm.set_object_name(
-                self.composite_render_pass,
-                "Composite sRGB Render Pass",
             );
 
             // Scene color images (per swapchain image)
@@ -648,22 +648,22 @@ impl PostProcessResources {
             }
 
             // Bloom framebuffers
-            dm.set_object_name(self.bright_mip0_framebuffer, "Bright Pass Framebuffer");
+            dm.set_object_name(self.bright_mip0_framebuffer, "Bloom Prefilter Framebuffer");
             for (i, &fb) in self.blur_temp_framebuffers.iter().enumerate() {
-                dm.set_object_name(fb, &format!("Blur Temp Framebuffer {}", i));
+                dm.set_object_name(fb, &format!("Bloom Blur Temp Framebuffer {}", i));
             }
             for (i, &fb) in self.blur_mip_framebuffers.iter().enumerate() {
-                dm.set_object_name(fb, &format!("Blur Mip Framebuffer {}", i));
+                dm.set_object_name(fb, &format!("Bloom Blur Mip Framebuffer {}", i));
             }
 
             // Pipelines
             if let Some(ref bp) = self.bright_pipeline {
-                dm.set_object_name(bp.pipeline, "Bright Pipeline");
-                dm.set_object_name(bp.pipeline_layout, "Bright Pipeline Layout");
+                dm.set_object_name(bp.pipeline, "Bloom Prefilter Pipeline");
+                dm.set_object_name(bp.pipeline_layout, "Bloom Prefilter Pipeline Layout");
             }
             if let Some(ref bp) = self.blur_pipeline {
-                dm.set_object_name(bp.pipeline, "Blur Pipeline");
-                dm.set_object_name(bp.pipeline_layout, "Blur Pipeline Layout");
+                dm.set_object_name(bp.pipeline, "Bloom Blur Pipeline");
+                dm.set_object_name(bp.pipeline_layout, "Bloom Blur Pipeline Layout");
             }
             if let Some(ref cp) = self.composite_pipeline {
                 dm.set_object_name(cp.pipeline, "Composite Pipeline");
@@ -703,14 +703,14 @@ impl PostProcessResources {
 
             // Input descriptor sets
             for (i, &set) in self.bright_input_sets.iter().enumerate() {
-                dm.set_object_name(set, &format!("Bright Input Set Image {}", i));
+                dm.set_object_name(set, &format!("Bloom Prefilter Input Set Image {}", i));
             }
             for (i, &set) in self.blur_input_sets.iter().enumerate() {
                 let level = i / 2;
                 let dir = if i % 2 == 0 { "H" } else { "V" };
                 dm.set_object_name(
                     set,
-                    &format!("Blur Input Set Level {} {}", level, dir),
+                    &format!("Bloom Blur Input Set Level {} {}", level, dir),
                 );
             }
             for (i, &set) in self.composite_input_sets.iter().enumerate() {
@@ -737,10 +737,10 @@ impl PostProcessResources {
             device.destroy_pipeline_layout(self.blur_pipeline_layout, None);
             device.destroy_pipeline_layout(self.composite_pipeline_layout, None);
 
-            // Render passes
+            // Render passes (owned)
             device.destroy_render_pass(self.scene_render_pass, None);
             device.destroy_render_pass(self.postprocess_color_pass, None);
-            device.destroy_render_pass(self.composite_render_pass, None);
+            // composite_render_pass is owned by the Renderer; do not destroy.
 
             // Descriptor pool (frees all sets)
             device.destroy_descriptor_pool(self.descriptor_pool, None);

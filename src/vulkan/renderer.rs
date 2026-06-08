@@ -32,6 +32,7 @@ const DRAW_LABEL_COLOR: [f32; 4] = [0.3, 0.5, 1.0, 1.0];
 const SETUP_LABEL_COLOR: [f32; 4] = [0.8, 0.7, 0.2, 1.0];
 const SKYBOX_LABEL_COLOR: [f32; 4] = [0.4, 0.7, 0.9, 1.0];
 const BLUR_LABEL_COLOR: [f32; 4] = [0.6, 0.3, 0.9, 1.0];
+const POSTPROCESS_LABEL_COLOR: [f32; 4] = [0.8, 0.4, 0.6, 1.0];
 
 const ENV_BASE_PATH: &str = "assets/environment_map/ennis";
 
@@ -123,6 +124,7 @@ impl Renderer {
             &swapchain.image_views,
             swapchain.depth_view,
             MAX_FRAMES_IN_FLIGHT,
+            composite_render_pass,
         );
         let scene_render_pass = postprocess.scene_render_pass;
 
@@ -130,7 +132,6 @@ impl Renderer {
         let pipeline = create_pbr_pipeline(
             &ctx.device,
             scene_render_pass,
-            swapchain.extent,
             global_descriptor_set_layout,
             material_descriptor_set_layout,
             push_constant_size,
@@ -139,7 +140,6 @@ impl Renderer {
         let skybox_pipeline = create_skybox_pipeline(
             &ctx.device,
             scene_render_pass,
-            swapchain.extent,
             global_descriptor_set_layout,
         );
 
@@ -413,12 +413,11 @@ impl Renderer {
     }
 
     fn name_debug_objects(&self, ctx: &VulkanContext) {
-        let Some(dm) = ctx.debug_marker.as_ref() else {
-            return;
-        };
+        let dm = &ctx.debug_marker;
 
         unsafe {
-            dm.set_object_name(self.pipeline.render_pass, "Main PBR Render Pass");
+            // The scene render pass itself is owned and named by
+            // PostProcessResources (see `name_debug_objects` below).
             dm.set_object_name(self.pipeline.pipeline_layout, "PBR Pipeline Layout");
             dm.set_object_name(self.pipeline.pipeline, "PBR Graphics Pipeline");
             dm.set_object_name(
@@ -579,6 +578,16 @@ impl Renderer {
         } {
             Ok((index, _suboptimal)) => index,
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                // When acquire fails with OUT_OF_DATE, the semaphore is left
+                // in an indeterminate state per spec. Destroy and recreate it.
+                unsafe {
+                    ctx.device.destroy_semaphore(image_available, None);
+                }
+                self.image_available[frame] = unsafe {
+                    ctx.device
+                        .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                        .unwrap()
+                };
                 self.recreate_swapchain(ctx);
                 return;
             }
@@ -606,6 +615,7 @@ impl Renderer {
         }
 
         let light_dir = glam::Vec3::new(-0.5, -1.0, 0.5).normalize();
+        let prefilter_max_lod = (self.ibl.prefilter_map.mip_levels.saturating_sub(1)) as f32;
         let globals = GlobalUniforms {
             view: view.to_cols_array(),
             proj: proj.to_cols_array(),
@@ -613,6 +623,8 @@ impl Renderer {
             _pad0: 0.0,
             light_dir: [light_dir.x, light_dir.y, light_dir.z],
             light_intensity: 4.0,
+            prefilter_max_lod,
+            _pad1: [0.0; 3],
         };
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -632,7 +644,7 @@ impl Renderer {
 
         record_command_buffer(
             &ctx.device,
-            ctx.debug_marker.as_ref(),
+            &ctx.debug_marker,
             command_buffer,
             frame,
             image_index,
@@ -755,11 +767,12 @@ impl Renderer {
             &swapchain.image_views,
             swapchain.depth_view,
             MAX_FRAMES_IN_FLIGHT,
+            self.composite_render_pass,
         ));
 
         self.swapchain = swapchain;
 
-        if let Some(dm) = ctx.debug_marker.as_ref() {
+        { let dm = &ctx.debug_marker;
             unsafe {
                 name_swapchain_objects(dm, &self.swapchain);
                 for (i, &semaphore) in self.render_finished.iter().enumerate() {
@@ -851,9 +864,9 @@ impl Drop for Renderer {
             self.device.destroy_pipeline(self.pipeline.pipeline, None);
             self.device
                 .destroy_pipeline_layout(self.pipeline.pipeline_layout, None);
-            // self.pipeline.render_pass is the scene render pass owned by
-            // PostProcessResources. It is destroyed by postprocess.destroy()
-            // below; do not destroy it twice.
+            // The scene render pass that the PBR + skybox pipelines were
+            // created against is owned by PostProcessResources and is
+            // destroyed by `pp.destroy()` below.
 
             // Destroy the postprocess resources (descriptor pool, pipelines,
             // scene color images, bloom pyramid, framebuffers, render passes).
@@ -874,7 +887,7 @@ impl Drop for Renderer {
 
 fn record_command_buffer(
     device: &ash::Device,
-    debug_marker: Option<&DebugMarker>,
+    debug_marker: &DebugMarker,
     command_buffer: vk::CommandBuffer,
     frame: usize,
     image_index: u32,
@@ -898,7 +911,7 @@ fn record_command_buffer(
         device
             .begin_command_buffer(command_buffer, &begin_info)
             .unwrap();
-        if let Some(dm) = debug_marker {
+        { let dm = debug_marker;
             dm.begin_label(
                 command_buffer,
                 &format!("Frame {} / Swapchain Image {}", frame, image_index),
@@ -948,7 +961,7 @@ fn record_command_buffer(
         .clear_values(&scene_clear_values);
 
     unsafe {
-        if let Some(dm) = debug_marker {
+        { let dm = debug_marker;
             dm.begin_label(command_buffer, "Scene Pass", RENDER_PASS_LABEL_COLOR);
         }
         device.cmd_begin_render_pass(
@@ -956,7 +969,7 @@ fn record_command_buffer(
             &scene_pass_begin,
             vk::SubpassContents::INLINE,
         );
-        if let Some(dm) = debug_marker {
+        { let dm = debug_marker;
             dm.insert_label(
                 command_buffer,
                 "Set Dynamic Viewport/Scissor",
@@ -967,7 +980,7 @@ fn record_command_buffer(
         device.cmd_set_scissor(command_buffer, 0, std::slice::from_ref(&scissor));
 
         // ---- Draw skybox first ----
-        if let Some(dm) = debug_marker {
+        { let dm = debug_marker;
             dm.begin_label(command_buffer, "Draw Skybox", SKYBOX_LABEL_COLOR);
         }
         device.cmd_bind_pipeline(
@@ -996,12 +1009,12 @@ fn record_command_buffer(
             vk::IndexType::UINT32,
         );
         device.cmd_draw_indexed(command_buffer, skybox_index_count, 1, 0, 0, 0);
-        if let Some(dm) = debug_marker {
+        { let dm = debug_marker;
             dm.end_label(command_buffer);
         }
 
         // ---- Draw PBR geometry ----
-        if let Some(dm) = debug_marker {
+        { let dm = debug_marker;
             dm.insert_label(command_buffer, "Bind PBR Pipeline", SETUP_LABEL_COLOR);
         }
         device.cmd_bind_pipeline(
@@ -1010,7 +1023,7 @@ fn record_command_buffer(
             pbr_pipeline,
         );
 
-        if let Some(dm) = debug_marker {
+        { let dm = debug_marker;
             dm.insert_label(command_buffer, "Bind Global Descriptors", SETUP_LABEL_COLOR);
         }
         device.cmd_bind_descriptor_sets(
@@ -1023,7 +1036,7 @@ fn record_command_buffer(
         );
 
         for (mesh_index, mesh) in scene.meshes.iter().enumerate() {
-            if let Some(dm) = debug_marker {
+            { let dm = debug_marker;
                 dm.begin_label(
                     command_buffer,
                     &format!(
@@ -1041,7 +1054,7 @@ fn record_command_buffer(
             };
             let pc_bytes = bytemuck::bytes_of(&pc);
 
-            if let Some(dm) = debug_marker {
+            { let dm = debug_marker;
                 dm.insert_label(
                     command_buffer,
                     "Push Constants: model matrix + material index",
@@ -1056,7 +1069,7 @@ fn record_command_buffer(
                 pc_bytes,
             );
 
-            if let Some(dm) = debug_marker {
+            { let dm = debug_marker;
                 dm.insert_label(
                     command_buffer,
                     "Bind Material Descriptor Set",
@@ -1072,7 +1085,7 @@ fn record_command_buffer(
                 &[],
             );
 
-            if let Some(dm) = debug_marker {
+            { let dm = debug_marker;
                 dm.insert_label(
                     command_buffer,
                     "Bind Vertex/Index Buffers",
@@ -1093,13 +1106,13 @@ fn record_command_buffer(
             );
             device.cmd_draw_indexed(command_buffer, mesh.index_count, 1, 0, 0, 0);
 
-            if let Some(dm) = debug_marker {
+            { let dm = debug_marker;
                 dm.end_label(command_buffer);
             }
         }
 
         device.cmd_end_render_pass(command_buffer);
-        if let Some(dm) = debug_marker {
+        { let dm = debug_marker;
             dm.end_label(command_buffer);
         }
     }
@@ -1109,9 +1122,14 @@ fn record_command_buffer(
     // at the end of the scene render pass (because the scene render pass
     // declared that final_layout), so we can sample it directly.
     unsafe {
-        // Bright pass: scene color -> bloom mip 0.
-        if let Some(dm) = debug_marker {
-            dm.begin_label(command_buffer, "Bright Pass", RENDER_PASS_LABEL_COLOR);
+        { let dm = debug_marker;
+            dm.begin_label(command_buffer, "PostProcessing", POSTPROCESS_LABEL_COLOR);
+        }
+
+        // Bloom Prefilter: extract highlights (soft-threshold) from scene color
+        // and write to bloom mip 0.
+        { let dm = debug_marker;
+            dm.begin_label(command_buffer, "Bloom Prefilter", RENDER_PASS_LABEL_COLOR);
         }
         record_bright_pass(
             device,
@@ -1122,13 +1140,13 @@ fn record_command_buffer(
             frame,
             extent,
         );
-        if let Some(dm) = debug_marker {
+        { let dm = debug_marker;
             dm.end_label(command_buffer);
         }
 
         // Blur passes: per mip, horizontal then vertical (ping-pong).
-        if let Some(dm) = debug_marker {
-            dm.begin_label(command_buffer, "Blur Pyramid", RENDER_PASS_LABEL_COLOR);
+        { let dm = debug_marker;
+            dm.begin_label(command_buffer, "Bloom Pyramid", RENDER_PASS_LABEL_COLOR);
         }
         record_blur_passes(
             device,
@@ -1138,12 +1156,12 @@ fn record_command_buffer(
             frame,
             extent,
         );
-        if let Some(dm) = debug_marker {
+        { let dm = debug_marker;
             dm.end_label(command_buffer);
         }
 
         // Composite: scene + 8 bloom mips + exposure + tonemap -> swapchain.
-        if let Some(dm) = debug_marker {
+        { let dm = debug_marker;
             dm.begin_label(command_buffer, "Composite Pass", RENDER_PASS_LABEL_COLOR);
         }
         record_composite_pass(
@@ -1156,12 +1174,16 @@ fn record_command_buffer(
             composite_framebuffer,
             extent,
         );
-        if let Some(dm) = debug_marker {
+        { let dm = debug_marker;
+            dm.end_label(command_buffer);
+        }
+
+        { let dm = debug_marker;
             dm.end_label(command_buffer);
         }
     }
 
-    if let Some(dm) = debug_marker {
+    { let dm = debug_marker;
         unsafe { dm.end_label(command_buffer); }
     }
     unsafe {
@@ -1169,10 +1191,11 @@ fn record_command_buffer(
     }
 }
 
-/// Record a single bright-pass render pass. Output is bloom mip 0.
+/// Record the Bloom Prefilter pass. Extracts HDR highlights via soft
+/// threshold and writes the result to bloom mip 0.
 unsafe fn record_bright_pass(
     device: &ash::Device,
-    _debug_marker: Option<&DebugMarker>,
+    _debug_marker: &DebugMarker,
     command_buffer: vk::CommandBuffer,
     postprocess: &PostProcessResources,
     image_index: usize,
@@ -1226,7 +1249,7 @@ unsafe fn record_bright_pass(
 /// between the mip image and the temp image. Framebuffers are pre-allocated.
 unsafe fn record_blur_passes(
     device: &ash::Device,
-    debug_marker: Option<&DebugMarker>,
+    debug_marker: &DebugMarker,
     command_buffer: vk::CommandBuffer,
     postprocess: &PostProcessResources,
     frame: usize,
@@ -1251,10 +1274,10 @@ unsafe fn record_blur_passes(
 
         // ---- Horizontal: read from mip[level], write to temp[level]. ----
         // Use blur_input_sets[2*level] which is pre-bound to mip[level].
-        if let Some(dm) = debug_marker {
+        { let dm = debug_marker;
             dm.insert_label(
                 command_buffer,
-                &format!("Blur Mip {} Horizontal", level),
+                &format!("Bloom Mip {} Horizontal Blur", level),
                 BLUR_LABEL_COLOR,
             );
         }
@@ -1301,10 +1324,10 @@ unsafe fn record_blur_passes(
 
         // ---- Vertical: read from temp[level], write to mip[level]. ----
         // Use blur_input_sets[2*level+1] which is pre-bound to temp[level].
-        if let Some(dm) = debug_marker {
+        { let dm = debug_marker;
             dm.insert_label(
                 command_buffer,
-                &format!("Blur Mip {} Vertical", level),
+                &format!("Bloom Mip {} Vertical Blur", level),
                 BLUR_LABEL_COLOR,
             );
         }
@@ -1356,7 +1379,7 @@ unsafe fn record_blur_passes(
 /// attachment in PRESENT_SRC_KHR.
 unsafe fn record_composite_pass(
     device: &ash::Device,
-    _debug_marker: Option<&DebugMarker>,
+    _debug_marker: &DebugMarker,
     command_buffer: vk::CommandBuffer,
     postprocess: &PostProcessResources,
     image_index: usize,

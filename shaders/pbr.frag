@@ -7,6 +7,7 @@ layout(set = 0, binding = 0) uniform GlobalUBO {
     float _pad0;
     vec3 lightDir;
     float lightIntensity;
+    float prefilterMaxLod;
 } globals;
 
 struct Material {
@@ -141,8 +142,9 @@ void main() {
 
     // Specular IBL
     vec3 R = reflect(-V, N);
-    const float MAX_PREFILTER_LOD = 10.0; // prefilter_map has 11 mip levels (0..10)
-    vec3 prefilteredColor = textureLod(uPrefilterMap, R, roughness * MAX_PREFILTER_LOD).rgb;
+    // The prefilter chain may have any number of mip levels; the renderer
+    // reports `mip_levels - 1` as `globals.prefilterMaxLod`.
+    vec3 prefilteredColor = textureLod(uPrefilterMap, R, roughness * globals.prefilterMaxLod).rgb;
     vec2 brdf = texture(uBRDFLUT, vec2(NdotV, roughness)).rg;
     vec3 specular_ibl = prefilteredColor * (F_ambient * brdf.x + brdf.y);
 
