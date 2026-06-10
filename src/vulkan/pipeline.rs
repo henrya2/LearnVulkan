@@ -198,7 +198,7 @@ pub fn create_skybox_pipeline(
         .rasterizer_discard_enable(false)
         .polygon_mode(vk::PolygonMode::FILL)
         .line_width(1.0)
-        .cull_mode(vk::CullModeFlags::BACK) // View from inside (after Y-flip viewport, inside = front face)
+        .cull_mode(vk::CullModeFlags::FRONT) // CW-from-outside geometry viewed from inside; cull outside, keep inside
         .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
         .depth_bias_enable(false);
 

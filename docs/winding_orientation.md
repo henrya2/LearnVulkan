@@ -268,19 +268,46 @@ Since glTF 2.0 uses right-handed coordinates by default, the original model shou
 
 ---
 
-# Skybox Winding — Why `cull_mode = BACK`
+# Code-Defined Geometry Rule
 
-> **Bold note:** The skybox pipeline uses `cull_mode = BACK` (see
-> `src/vulkan/pipeline.rs:271`), the **same** cull mode as the PBR pipeline. The
-> reason is not a coincidence — both pipelines share the negative-height
-> viewport (the one improper transform in the chain), and both keep the
-> triangles whose framebuffer-space winding is CCW (which the rasterizer treats
-> as front-facing with `frontFace = COUNTER_CLOCKWISE`). The math below shows
-> exactly why.
+**All code-defined geometry in this project MUST be authored in LH Y-up model
+space with CW-from-outside front-face winding.** This is the same convention
+that glTF models end up in after the loader's Z-negate conversion (§3c).
+
+For a triangle in LH model space: the cross product `(v1−v0) × (v2−v0)` should
+point **toward the viewer** when the triangle is viewed from its front (outside)
+side. Since the front face is **CW** in LH, the cross product of the CW-ordered
+vertices points **into** the surface (i.e., opposite the outward normal). This
+is the natural consequence of the algebraic cross-product formula applied in a
+left-handed basis with CW front-face convention.
+
+**Skybox special case:** The skybox cube is code-defined geometry, so it follows
+the same rule: **CW-from-outside in LH model space**. However, the skybox is
+viewed from the **inside** (the camera sits at the origin, inside the cube).
+This means the rasterizer must cull the **outside** faces (which the camera
+cannot see) and keep the **inside** faces. Since CW-from-outside geometry has
+its front side = outside, the pipeline uses `cull_mode = FRONT` to cull the
+outside and render the inside. This is the **opposite** cull mode from typical
+geometry (which is viewed from outside and uses `BACK` to cull the inside
+faces).
+
+---
+
+# Skybox Winding — Why `cull_mode = FRONT`
+
+> **Bold note:** The skybox pipeline uses `cull_mode = FRONT` (see
+> `src/vulkan/pipeline.rs:201`). This is **different** from the PBR pipeline's
+> `cull_mode = BACK`. Both pipelines' geometries are **CW-from-outside in LH
+> world space**, but the skybox is viewed from **inside** (camera at origin),
+> while the PBR model is viewed from **outside**. The cull mode difference
+> follows naturally: FRONT culls the outside of CW-from-outside geometry (which
+> the inside camera doesn't see), while BACK culls the inside of CW-from-outside
+> geometry (which the outside camera doesn't see). The math below shows exactly
+> why.
 
 ## S1. Skybox geometry
 
-`src/vulkan/renderer.rs:280-298` defines a unit cube centered at the origin:
+`src/vulkan/renderer.rs:312-330` defines a unit cube centered at the origin:
 
 | Vertex | Position (world) |
 |---|---|
@@ -293,31 +320,41 @@ Since glTF 2.0 uses right-handed coordinates by default, the original model shou
 | 6 | (+1, +1, +1) |
 | 7 | (-1, +1, +1) |
 
-Index buffer (36 indices = 12 triangles, 6 faces × 2 triangles each):
+Index buffer (36 indices = 12 triangles, 6 faces × 2 triangles each),
+**CW-from-outside in LH Y-up model space**:
 
 ```
-Front (+Z) : (4,5,6) (4,6,7)
-Back  (-Z) : (1,0,3) (1,3,2)
-Top   (+Y) : (3,7,6) (3,6,2)
-Bot   (-Y) : (0,1,5) (0,5,4)
-Right (+X) : (1,2,6) (1,6,5)
-Left  (-X) : (0,4,7) (0,7,3)
+Front (+Z): (4,6,5) (4,7,6)
+Back  (-Z): (1,3,0) (1,2,3)
+Top   (+Y): (3,6,7) (3,2,6)
+Bot   (-Y): (0,5,1) (0,4,5)
+Right (+X): (1,6,2) (1,5,6)
+Left  (-X): (0,7,4) (0,3,7)
 ```
 
-**Convention check — front face `(4, 5, 6)`:**
+**Convention check — +Z face `(4, 6, 5)`:**
 
 ```
 v4 = (-1, -1, +1)
-v5 = (+1, -1, +1)
 v6 = (+1, +1, +1)
+v5 = (+1, -1, +1)
 ```
 
 In the world XY-plane (LH Y-up, +X right, +Y up), the order
-lower-left → lower-right → upper-right is CCW. The cross product
-`(v5 − v4) × (v6 − v4) = (2, 0, 0) × (0, 2, 0) = (0, 0, +4)` points in **+Z**,
-which is the **outward** normal of the +Z face. ✓
+lower-left → upper-right → lower-right is CW. The cross product
+`(v6 − v4) × (v5 − v4) = (2, 2, 0) × (2, 0, 0) = (0, 0, −4)` points **−Z**
+(into the cube from the +Z face). This is consistent with CW-from-outside
+convention in LH: the cross product of CW-ordered vertices points **inward**
+(opposite the outward normal). ✓
 
-**The cube index buffer is CCW-from-outside in world space (LH Y-up).**
+**The cube index buffer is CW-from-outside in world space (LH Y-up).**
+
+### Derivation: CCW → CW conversion
+
+Each triangle in the old CCW-from-outside index buffer was converted to
+CW-from-outside by swapping its last two indices. Swapping two vertices
+reverses the cross-product sign, flipping the triangle from CCW to CW
+while keeping the same "from-outside" perspective.
 
 ## S2. Transform chain (world → framebuffer)
 
@@ -365,163 +402,113 @@ For any world-space triangle with a well-defined 2D projection onto the
 screen, the 2D signed area in framebuffer is **flipped in sign** relative
 to the world-space interpretation. Specifically:
 
-- If the triangle's index order, when projected to the world XY-plane,
-  is **CCW** (cross product in +Z, the world-up direction), then after
-  the Y-flip viewport it is **CW in framebuffer**.
-- This is a statement about the **sign of the framebuffer signed area**,
-  which is a single number for any 2D triangle.
+- CW-from-outside in world → Y-flip viewport → **CCW-in-framebuffer for the outside face**
+- Camera is **inside** the cube → the visible side is the **inside** (opposite of outside)
+- Opposite of CCW is CW → **visible interior produces CW-in-framebuffer triangles**
 
-The world-space "CCW-from-outside" convention (used by the cube index
-buffer) means: looking at the triangle from its **outward** side, the
-index order traces CCW. The outward side of a triangle is the side from
-which the cross product `(v1 − v0) × (v2 − v0)` points toward the viewer.
-
-**Key insight:** the framebuffer signed area of a 2D triangle is
-**opposite in sign to "what you would see looking at the triangle from
-its outward side"**. The outward side is the side that, in world space,
-is "facing the camera" for an outside-looking camera. From the inside
-of a CCW-from-outside cube, the camera looks at the **inside** of the
-walls, which is the **opposite** side from the outward direction.
-Therefore the visible 2D winding in framebuffer is the **opposite** of
-the framebuffer winding that the index order would produce for the
-outward side.
-
-Concretely:
-- World-side: CCW-from-outside index order.
-- After one Y-flip in the chain, the outward-side projection in
-  framebuffer is CW.
-- The camera is on the inside (opposite side from outward), so the
-  visible 2D winding in framebuffer is **CCW**.
-
-**For a cube with CCW-from-outside indexing, viewed from inside through
+**For a cube with CW-from-outside indexing, viewed from inside through
 one Y-flip in the transform chain: the visible interior surfaces produce
-CCW-in-framebuffer triangles.**
+CW-in-framebuffer triangles.**
 
 ## S4. Rasterizer decision
 
-`src/vulkan/pipeline.rs:271-272`:
+`src/vulkan/pipeline.rs:201-203`:
 
 ```rust
-.cull_mode(vk::CullModeFlags::BACK)
+.cull_mode(vk::CullModeFlags::FRONT)
 .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
 ```
 
-`cull_mode = BACK` + `front_face = CCW` means: cull triangles whose
-framebuffer-space signed area is **negative** (i.e., CW in framebuffer);
-keep triangles whose framebuffer-space signed area is **positive** (CCW in
+`cull_mode = FRONT` + `front_face = CCW` means: cull triangles whose
+framebuffer-space signed area is **positive** (i.e., CCW in framebuffer);
+keep triangles whose framebuffer-space signed area is **negative** (CW in
 framebuffer).
 
-Per §S3, the visible interior of the cube produces **CCW-in-framebuffer**
+Per §S3, the visible interior of the cube produces **CW-in-framebuffer**
 triangles. These are kept. ✓
 
-If `cull_mode` were `FRONT` instead, the GPU would cull the visible interior
-surfaces and keep only the back-faces (the outside of the cube, which the
-camera does not see). The result would be an empty framebuffer. This is
-exactly the bug that was originally in `pipeline.rs:271` — it was set to
-`FRONT`, culling the skybox. The fix is `BACK`.
+If `cull_mode` were `BACK` instead, the GPU would cull the visible interior
+surfaces (CW) and keep only the outside faces (CCW, which the camera doesn't
+see). The result would be an empty framebuffer.
 
-## S5. Why the PBR pipeline also uses `cull_mode = BACK`
+## S5. Why the PBR pipeline uses `cull_mode = BACK`
 
-`src/vulkan/pipeline.rs:136` — the PBR pipeline uses the same cull mode.
-This is **not** a coincidence; both pipelines share the same Y-flip
-viewport and the same rasterizer rule.
+`src/vulkan/pipeline.rs:68` — the PBR pipeline uses `cull_mode = BACK`.
+This is **not** a coincidence; both pipelines' geometries are CW-from-outside
+in LH world, but the camera position differs.
 
 - **PBR (helmet):** the glTF loader negates Z on every vertex
   (`src/scene/gltf_loader.rs:186-203`). This is an improper transform
   applied **at load time**, with det = −1. The helmet's index buffer is
   CCW-from-outside in glTF's RH world; after Z-negation, it is
-  **CW-from-outside in the project's LH world** (`docs/winding_orientation.md`
-  §3c). The Y-flip viewport is the second improper transform. Two
-  improper transforms cancel: the helmet's outside-facing triangles are
-  **CCW in framebuffer**, and the camera (on the outside of the helmet)
-  sees them. `cull_mode = BACK` keeps them.
+  **CW-from-outside in the project's LH world** (§3c). The Y-flip viewport
+  is the second improper transform. Two improper transforms cancel: the
+  helmet's outside-facing triangles are **CCW in framebuffer**, and the
+  camera (on the outside of the helmet) sees them. `cull_mode = BACK` keeps
+  them.
 
-- **Skybox (cube):** there is **no** load-time Z-negation. The cube index
-  buffer is CCW-from-outside in world (LH Y-up). The Y-flip viewport is
-  the only improper transform. The camera is on the **inside** of the
-  cube, which corresponds to the **opposite** framebuffer winding from
-  "looking from outside" — i.e., **CCW in framebuffer**. `cull_mode = BACK`
-  keeps them.
+- **Skybox (cube):** CW-from-outside in LH world (code-defined, no Z-negate).
+  The Y-flip viewport is the only improper transform. The outside face
+  becomes CCW in framebuffer; the camera, **inside** the cube, sees the
+  opposite winding: **CW in framebuffer**. `cull_mode = FRONT` culls the
+  front (CCW = outside = invisible to the camera) and keeps the back
+  (CW = inside = visible). ✓
 
-| Pipeline | World-space winding (outside) | Improper transforms in chain | Framebuffer-space winding (visible side) | `cull_mode` |
-|---|---|---|---|---|
-| PBR (helmet) | CW (after glTF Z-negate) | 2 (Z-negate + viewport) | CCW (camera on outside) | `BACK` (keep CCW) |
-| Skybox (cube) | CCW (no load transform) | 1 (viewport only) | CCW (camera on inside) | `BACK` (keep CCW) |
-
-**The shared invariant: the rasterizer keeps the side of the surface the
-camera is on, under `cull_mode = BACK` and `front_face = CCW`.**
-
-## S6. The "FRONT cull for skybox" advice — why it doesn't apply here
-
-Some Vulkan tutorials and the project's own earlier notes
-(`docs/correct_pbr_plan.md:566`, `docs/ibl_implementation_plan.md:342`)
-advise `cull_mode = FRONT` for skyboxes. That advice comes from a
-config where the **index buffer is CW-from-outside in world space**
-(e.g., the cube is constructed with CW indices, as is common in
-OpenGL-era code), so that the outside is back-facing under the standard
-NDC convention and the camera-on-inside sees the front. With that index
-convention, the visible interior surfaces are front-facing in framebuffer
-and the **outside** is back-facing. `cull_mode = FRONT` would cull the
-back-faces — but the camera is **inside** the cube, not outside, so
-"cull the outside" doesn't make sense in that interpretation.
-
-The advice is internally confused. The correct invariant — which holds
-**regardless of which config from `§8` is used, as long as the cube
-index buffer is CCW-from-outside in world space** — is: the visible
-interior of the cube (the side the camera is on) corresponds to
-**CCW-in-framebuffer triangles**, and `cull_mode = BACK` keeps them.
-
-Under the "Vulkan classic" config B (no Z-negate, projection Y-flip,
-positive viewport), the transform chain is:
-
-| Step | Det | Framebuffer winding |
-|---|---|---|
-| World → view | +1 | CCW (CCW-from-outside index buffer) |
-| View → clip (with Y-flip in projection) | **−1** | **CW** |
-| Clip → NDC | +1 | CW |
-| Viewport (positive height) | +1 | CW |
-
-The visible side of the cube (camera inside) is the **opposite** 2D
-winding from "looking from outside" — i.e., **CCW** in framebuffer.
-`cull_mode = BACK` keeps CCW, so the skybox is visible. Same answer as
-this project.
-
-**The shared invariant across all three configs in `§8`:** with a
-CCW-from-outside cube index buffer, the skybox uses `cull_mode = BACK`
-under the rule "the side the camera is on has CCW-in-framebuffer
-winding."
-
-## S7. Anti-symmetry with the PBR pipeline — why this is not "double-cull"
-
-A common confusion: "the helmet is outside-facing with one winding, the
-skybox is inside-facing with the same winding, so shouldn't the cull
-mode be opposite?" The answer is **no**, because the cull mode and the
-winding are not two independent parameters — the rasterizer's cull test
-measures 2D winding in framebuffer, and the 2D winding of the visible
-side is CCW in both pipelines.
-
-| Pipeline | Index order (world) | Camera position | 2D winding in framebuffer (visible side) | Rasterizer calls it | Cull |
+| Pipeline | World-space winding (outside) | Improper transforms | Framebuffer-space winding (visible side) | Cull mode | Rule |
 |---|---|---|---|---|---|
-| PBR | CW-from-outside (CCW-from-outside glTF → Z-negate → CW) | outside | CCW | front | keep (BACK) |
-| Skybox | CCW-from-outside | inside | CCW | front | keep (BACK) |
+| PBR (helmet) | CW (after glTF Z-negate) | 2 (Z-negate + viewport) → cancel | CCW (camera on outside) | `BACK` (keep CCW) | Keep visible outside |
+| Skybox (cube) | CW (code-defined) | 1 (viewport only) | CW (camera on inside → opposite of CCW-outside) | `FRONT` (keep CW) | Keep visible inside |
 
-Both pipelines end up with the **same** rasterizer call ("front") for
-the visible side, so both use `cull_mode = BACK`.
+**The shared rule:** all geometry is CW-from-outside in LH world. The pipeline
+cull mode depends on whether the camera is on the outside (`BACK`) or inside
+(`FRONT`) of the geometry.
+
+## S6. The "FRONT cull for skybox" advice — why it applies here
+
+Many Vulkan tutorials advise `cull_mode = FRONT` for skyboxes. This advice
+comes from a config where:
+- The cube index buffer is CW-from-outside in world space
+- The only winding flip in the chain is a projection Y-flip (or viewport Y-flip)
+- The camera is inside the cube
+
+Under those conditions, the visible interior surfaces become front-facing in
+framebuffer after the single flip, and FRONT cull would cull them — which is
+wrong. The advice is actually correct only when the cube uses CCW-from-outside
+indexing (so the inside becomes front-facing after the flip, and BACK cull
+keeps it). Most tutorials are ambiguous about their cube winding convention,
+hence the confusion.
+
+**This project's rule eliminates the ambiguity:** all code-defined geometry is
+**CW-from-outside in LH model space**, and the skybox's `cull_mode = FRONT` is
+a direct consequence: cull the outside (which is front for CW-from-outside) so
+the inside is visible.
+
+## S7. Unified Pipeline Comparison
+
+| Pipeline | Geometry winding (world, outside) | Camera | Impropers | Framebuffer (visible) | `cull_mode` | `front_face` |
+|---|---|---|---|---|---|---|
+| PBR | CW-from-outside (glTF → Z-negate) | outside | 2 (cancel) | CCW | `BACK` | `CCW` |
+| Skybox | CW-from-outside (code-defined) | inside | 1 | CW | `FRONT` | `CCW` |
+| Postprocess | CW fullscreen tri (code-defined) | N/A | 1 (viewport) | CW = front (kept) | `NONE` | `CCW` |
+
+**Both PBR and skybox share `front_face = CCW`.** The cull mode follows from
+the camera position relative to the CW-from-outside geometry.
 
 ## S8. Summary
 
-- **The skybox pipeline uses `cull_mode = BACK` because the cube index
-  buffer is CCW-from-outside in world space (LH Y-up), and the only
-  improper transform in the world→framebuffer chain is the Y-flip
-  viewport.**
-- **The camera, positioned on the inside of the cube, sees the interior
-  surfaces, which correspond to CCW-in-framebuffer triangles. The
-  rasterizer keeps them under `cull_mode = BACK` and `front_face = CCW`.**
-- **The PBR pipeline uses the same cull mode, for an analogous but
-  separately-derived reason: the helmet's outside-facing triangles are
-  CCW-in-framebuffer after two cancelling improper transforms
-  (Z-negate at load, Y-flip viewport at draw), and the camera on the
-  outside of the helmet sees them.**
+- **All code-defined geometry uses CW-from-outside winding in LH Y-up model
+  space.** This is the project convention and applies to the skybox cube,
+  postprocess fullscreen triangle, and any future procedural geometry.
+- **The skybox pipeline uses `cull_mode = FRONT` because the cube is
+  CW-from-outside and the camera is inside the cube.** After one Y-flip
+  viewport, the outside becomes CCW-in-framebuffer (front-facing), and the
+  visible inside is CW-in-framebuffer (back-facing, kept by FRONT cull).
+- **The PBR pipeline uses `cull_mode = BACK` because the helmet is
+  CW-from-outside (after glTF Z-negate) and the camera is outside.** After
+  two cancelling flips, the visible outside is CCW-in-framebuffer
+  (front-facing, kept by BACK cull).
+- **The glTF loader is NOT changed.** It continues to convert from glTF's
+  RH CCW-from-outside to LH CW-from-outside via vertex Z-negation.
 
 ## S9. Authoritative references
 
@@ -532,4 +519,4 @@ the visible side, so both use `cull_mode = BACK`.
   transform with negative height).
 - **`glam` crate** v0.32 — `Mat4::look_to_lh`, `Mat4::perspective_lh`
   (both proper, no Y-flip baked in).
-- **`ash` crate** — `vk::CullModeFlags::BACK`, `vk::FrontFace::COUNTER_CLOCKWISE`.
+- **`ash` crate** — `vk::CullModeFlags::FRONT`/`BACK`, `vk::FrontFace::COUNTER_CLOCKWISE`.

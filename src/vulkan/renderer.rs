@@ -319,14 +319,15 @@ impl Renderer {
             [1.0, 1.0, 1.0],
             [-1.0, 1.0, 1.0],
         ];
+        // CW-from-outside in LH Y-up model space (consistent with code-defined geometry rule)
         let skybox_indices: [u32; 36] = [
-            // Front
-            4, 5, 6, 4, 6, 7, // Back
-            1, 0, 3, 1, 3, 2, // Top
-            3, 7, 6, 3, 6, 2, // Bottom
-            0, 1, 5, 0, 5, 4, // Right
-            1, 2, 6, 1, 6, 5, // Left
-            0, 4, 7, 0, 7, 3,
+            // Front (+Z): CW from outside
+            4, 6, 5, 4, 7, 6, // Back (-Z): CW from outside
+            1, 3, 0, 1, 2, 3, // Top (+Y): CW from outside
+            3, 6, 7, 3, 2, 6, // Bottom (-Y): CW from outside
+            0, 5, 1, 0, 4, 5, // Right (+X): CW from outside
+            1, 6, 2, 1, 5, 6, // Left (-X): CW from outside
+            0, 7, 4, 0, 3, 7,
         ];
         let skybox_index_count = skybox_indices.len() as u32;
         let skybox_vertex_buffer = create_device_local_buffer(
