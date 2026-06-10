@@ -15,6 +15,8 @@ use app::App;
 struct AppHandler {
     app: Option<App>,
     enable_validation: bool,
+    width: u32,
+    height: u32,
 }
 
 impl ApplicationHandler for AppHandler {
@@ -22,7 +24,7 @@ impl ApplicationHandler for AppHandler {
         if self.app.is_none() {
             let attrs = Window::default_attributes()
                 .with_title("LearnVulkan - FPS Camera")
-                .with_inner_size(winit::dpi::LogicalSize::new(800, 600));
+                .with_inner_size(winit::dpi::LogicalSize::new(self.width, self.height));
             let window = event_loop.create_window(attrs).unwrap();
             self.app = Some(App::new(window, self.enable_validation));
         }
@@ -57,16 +59,38 @@ impl ApplicationHandler for AppHandler {
     }
 }
 
+fn parse_resolution() -> (u32, u32) {
+    let args: Vec<String> = std::env::args().collect();
+    for arg in &args {
+        if arg.starts_with("--resolution=") {
+            let val = arg.strip_prefix("--resolution=").unwrap();
+            if let Some((w, h)) = val.split_once('x') {
+                return (
+                    w.parse().unwrap_or(800),
+                    h.parse().unwrap_or(600),
+                );
+            }
+        }
+    }
+    (800, 600)
+}
+
 fn main() {
-    let enable_validation = std::env::args()
+    let args: Vec<String> = std::env::args().collect();
+    let enable_validation = args
+        .iter()
         .any(|arg| arg == "--validation" || arg == "--validate")
         || cfg!(debug_assertions);
+
+    let (width, height) = parse_resolution();
 
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut handler = AppHandler {
         app: None,
         enable_validation,
+        width,
+        height,
     };
     event_loop.run_app(&mut handler).unwrap();
 }
