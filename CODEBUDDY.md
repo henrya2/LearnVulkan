@@ -4,7 +4,7 @@ This file provides guidance to CodeBuddy Code when working with code in this rep
 
 ## Project Overview
 
-A Vulkan PBR renderer written in Rust. It loads and renders a **glTF 2.0 model** (DamagedHelmet) with metallic-roughness PBR shading and a prefiltered Ennis environment map (KTX2 cubemaps under `assets/environment_map/ennis/`) used for full image-based lighting (env cubemap, irradiance, GGX prefilter, BRDF LUT), in an 800x600 window using raw Vulkan bindings (`ash`). A **postprocessing framework** provides HDR bloom (8-mip separable Gaussian) and runtime-switchable tonemapping (Linear/Reinhard/ACES) with exposure control. The camera is a free-fly FPS style with mouse look (pitch/yaw), WASD movement, Space/LShift for vertical movement, and click-to-lock cursor behavior.
+A Vulkan PBR renderer written in Rust. It loads and renders a **glTF 2.0 model** (DamagedHelmet) with metallic-roughness PBR shading and a prefiltered Ennis environment map (KTX2 cubemaps under `assets/environment_map/ennis/`) used for full image-based lighting (env cubemap, irradiance, GGX prefilter, BRDF LUT), in a configurable window (default 800x600) using raw Vulkan bindings (`ash`). A **postprocessing framework** provides HDR bloom (8-mip separable Gaussian) and runtime-switchable tonemapping (Linear/Reinhard/ACES) with exposure control. The camera is a free-fly FPS style with mouse look (pitch/yaw), WASD movement, Space/LShift for vertical movement, and click-to-lock cursor behavior.
 
 - **Renderer**: `ash` 0.38
 - **Windowing**: `winit` 0.30 with the `ApplicationHandler` trait (no deprecated APIs)
@@ -25,6 +25,9 @@ cargo build
 
 # Run
 cargo run
+
+# Run with custom resolution (default 800x600)
+cargo run -- --resolution=1920x1080
 
 # Run a release build with Vulkan validation layers enabled
 cargo run --release -- --validation

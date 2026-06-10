@@ -1,6 +1,6 @@
 # LearnVulkan
 
-A Vulkan PBR renderer written in Rust. It loads and renders glTF 2.0 models (DamagedHelmet) with metallic-roughness PBR shading, normal mapping, and image-based lighting from the Ennis glTF sample environment (KTX2 cubemaps under `assets/environment_map/ennis/`), in an 800x600 window using raw Vulkan bindings (`ash`).
+A Vulkan PBR renderer written in Rust. It loads and renders glTF 2.0 models (DamagedHelmet) with metallic-roughness PBR shading, normal mapping, and image-based lighting from the Ennis glTF sample environment (KTX2 cubemaps under `assets/environment_map/ennis/`), in a configurable window (default 800x600) using raw Vulkan bindings (`ash`).
 
 ## Features
 
@@ -53,8 +53,11 @@ cd ..
 # Build & run
 cargo run
 
+# Run with custom resolution
+cargo run -- --resolution=1920x1080
+
 # Run a release build with Vulkan validation layers enabled
-cargo run --release -- --validation
+cargo run --release -- --resolution=1280x720 --validation
 ```
 
 ## Controls
