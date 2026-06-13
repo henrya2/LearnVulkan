@@ -20,7 +20,7 @@ layout(set = 0, binding = 8) uniform sampler2D uBloom7;
 layout(set = 1, binding = 0) uniform PostProcessUBO {
     vec4 exposurePack;        // .x = exposure, .y = bloom_threshold, .z = bloom_knee, .w = bloom_intensity
     vec4 bloom_weights[2];    // 8 logical weights packed in .xyzw of each
-    vec4 tonemapPack;         // .x = floatBitsToUint(tonemap_op), .yzw = 0 (dead)
+    vec4 tonemapPack;         // .x = floatBitsToUint(tonemap_op), .yzw reserved (channel-reuse policy; .w is the std140 block round-up)
 } pp;
 
 layout(location = 0) in vec2 vUV;

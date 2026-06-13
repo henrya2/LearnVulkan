@@ -65,11 +65,30 @@ who add a new shader buffer must follow §10's checklist.
 
 Scalar values are bit-packed into `Vec4` channels:
 
-- **CPU write**: `f32::from_bits(my_u32)` into the chosen channel
-  (`.x` is canonical).
+- **CPU write**: `f32::from_bits(my_u32)` into the chosen channel.
 - **CPU read**: `self.tail.x.to_bits()`.
 - **GPU write**: `uintBitsToFloat(my_uint)` into the chosen channel.
 - **GPU read**: `floatBitsToUint(pp.tonemap_pack.x)`.
+
+**Channel-reuse policy.** The previous version of this rule said
+"`.x` is canonical"; that has been replaced with a channel-agnostic
+policy. Any free channel (x, y, z, or w) of any group-named `Vec4`
+in a GLSL block is fair game for a bit-packed scalar, **provided**:
+
+- The GLSL block declares the slot (a `vec4 foo;` declaration
+  implicitly reserves `.w`; the comment on the GLSL field must say
+  so even if the shader never reads the channel).
+- The Rust struct mirrors the channel 1:1 and provides a named
+  setter/getter for it.
+- The pack is **opportunistic** — do not introduce reserved fields
+  speculatively; pack only when a real scalar needs a slot.
+
+The only structural exception is the **std140 alignment pad**:
+when the GLSL block declares a `vec3` followed by another field,
+std140 rounds the `vec3` to 16 B and the trailing 4 B is an
+alignment pad, not a free slot. The Rust `Vec4` mirroring it
+keeps `.w` at 0 forever — **never** bit-pack here. The
+`GpuMaterial::emissive_factor.w` is the canonical example.
 
 The mapping is documented and enforced by **named setter / getter
 methods** on the struct (e.g.
@@ -80,7 +99,7 @@ bit-packed scalars, not a single one.
 
 The same rule applies to push-constant blocks (Vulkan §15.8.1):
 the struct is a sequence of `Mat4` and `Vec4` fields, with the last
-`Vec4` often carrying the bit-packed tail of data and dead
+`Vec4` often carrying the bit-packed tail of data and reserved
 channels on the rest.
 
 ---
@@ -935,23 +954,32 @@ project, follow these five steps in order. Steps 1-3 are
 
 1. **Declare the GLSL block with `vec4` / `vec4[]` / `mat4`
    members only.** Decide the channel-to-type mapping for any
-   packed scalars. Document the mapping in a comment on the
-   GLSL block:
+   packed scalars. **Identify every free channel** (`.w` of a 3D
+   vector, `.y`/`.z`/`.w` of a single-purpose pack, or a trailing
+   round-up `Vec4`) and document it in a comment on the GLSL
+   block, even if no current consumer reads it. Example:
 
    ```glsl
    layout(set = N, binding = M) uniform MyBlock {
        mat4 transform;
        vec4 colors[4];           // .rgba per slot
        vec4 params;              // .x = threshold (f32), .y = mode (uint),
-                                 // .z = blend (f32), .w = 0 (dead)
+                                 // .z = blend (f32), .w reserved (per channel-reuse policy)
    } myBlock;
    ```
+
+   **Do not introduce a channel that the GLSL block has not
+   declared.** A GLSL `vec4 foo;` declaration implicitly reserves
+   all four channels; the shader is free to ignore them but the
+   CPU is not free to repurpose them without updating the GLSL
+   comment.
 
 2. **Declare the matching Rust struct as
    `#[repr(C)] #[derive(Clone, Copy, Pod, Zeroable)]`.** All
    fields are `glam::Mat4`, `glam::Vec4`, or `[glam::Vec4;
-   N]`. Add a const assert to lock the size to the std140 block
-   size:
+   N]`. Mirror the GLSL field-for-field, including the
+   reserved channels. Add a const assert to lock the size to the
+   std140 block size:
 
    ```rust
    const _: [(); 96] = [(); std::mem::size_of::<MyBlock>()];
@@ -960,9 +988,11 @@ project, follow these five steps in order. Steps 1-3 are
    ```
 
 3. **Add `set_*` / `*` methods for every scalar that crosses
-   the boundary.** Use `f32::from_bits` for `u32` values and
-   `f32::from_bits(v as u32)` for `i32` values. Use
-   `to_bits() as i32` for the reverse. Document the
+   the boundary, including reserved channels** (use
+   `#[allow(dead_code)]` until a consumer exists — the API
+   surface is part of the contract). Use `f32::from_bits` for
+   `u32` values and `f32::from_bits(v as u32)` for `i32` values.
+   Use `to_bits() as i32` for the reverse. Document the
    channel-to-type mapping in each method's doc comment.
 
 4. **Wire the descriptor `range` to the const-locked size.** For

@@ -13,13 +13,15 @@ pub const BLOOM_MIP_COUNT: usize = 8;
 /// The block is a flat sequence of `Vec4` and `[Vec4; 2]` fields —
 /// the project-wide Vec4-base-element rule. There is no `_pad`
 /// field: the trailing `tonemap_pack` provides the std140 block
-/// round-up automatically.
+/// round-up automatically. Per the channel-reuse policy, every
+/// channel of every field is either consumed by the GLSL block
+/// or explicitly reserved on both sides — no speculative padding.
 ///
 /// | Offset | Bytes | Field | Notes |
 /// |--------|-------|-------|-------|
-/// | 0      | 16    | `exposure_pack`       | `.x`=exposure, `.y`=bloom_threshold, `.z`=bloom_knee, `.w`=bloom_intensity |
-/// | 16     | 32    | `bloom_weights[2]`    | 8 logical weights packed in `.xyzw` of each |
-/// | 48     | 16    | `tonemap_pack`        | `.x`=tonemap_op (uint via `f32::from_bits`), `.yz`=0 (dead), `.w`=std140 block round-up |
+/// | 0      | 16    | `exposure_pack`       | `.x`=exposure, `.y`=bloom_threshold, `.z`=bloom_knee, `.w`=bloom_intensity (all 4 channels consumed) |
+/// | 16     | 32    | `bloom_weights[2]`    | 8 logical weights packed in `.xyzw` of each (all 8 channels consumed) |
+/// | 48     | 16    | `tonemap_pack`        | `.x`=tonemap_op (uint via `f32::from_bits`), `.y`=reserved, `.z`=reserved, `.w`=std140 block round-up |
 /// | total  | 64    |                       | |
 ///
 /// References:
@@ -31,13 +33,15 @@ pub const BLOOM_MIP_COUNT: usize = 8;
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct PostProcessUBO {
     /// `.x` = exposure (stops), `.y` = bloom_threshold, `.z` = bloom_knee,
-    /// `.w` = bloom_intensity.
+    /// `.w` = bloom_intensity. All four channels are consumed.
     pub exposure_pack: Vec4,
-    /// 8 bloom weights, 4 per `Vec4` channel (`.xyzw`).
+    /// 8 bloom weights, 4 per `Vec4` channel (`.xyzw`). All eight
+    /// channels are consumed.
     pub bloom_weights: [Vec4; BLOOM_MIP_COUNT / 4],
     /// `.x` = tonemap_op (bit-packed `u32` via `f32::from_bits`).
-    /// 0 = linear, 1 = Reinhard, 2 = ACES. `.yz` = 0 (dead),
-    /// `.w` = std140 block round-up.
+    /// `0 = linear`, `1 = Reinhard`, `2 = ACES`. `.y` and `.z`
+    /// are **reserved** per the channel-reuse policy (no current
+    /// consumer); `.w` is the std140 block round-up (always 0 on CPU).
     pub tonemap_pack: Vec4,
 }
 
@@ -149,12 +153,13 @@ impl Default for PostProcessUBO {
 /// (no std140), but the project still applies the Vec4-base-element
 /// rule: the struct is a single `Vec4` whose `.xy` channels carry
 /// the texel size and whose `.z` channel carries the bit-packed
-/// `i32` direction. `.w` is dead on both sides.
+/// `i32` direction. `.w` is **reserved** per the channel-reuse policy
+/// (no current consumer).
 ///
 /// The shader side declares:
 /// ```glsl
 /// layout(push_constant) uniform BlurPC {
-///     vec4 params;   // .xy = uTexelSize, .z = intBitsToFloat(uDirection)
+///     vec4 params;   // .xy = uTexelSize, .z = intBitsToFloat(uDirection), .w reserved
 /// } pc;
 /// ```
 ///
@@ -166,7 +171,7 @@ impl Default for PostProcessUBO {
 pub struct BlurPushConstants {
     /// `.xy` = `texel_size` (1.0 / input image extent).
     /// `.z` = `direction` (bit-packed `i32` via `f32::from_bits`).
-    /// `.w` = 0 (dead).
+    /// `.w` = reserved (per channel-reuse policy; no current consumer).
     pub params: Vec4,
 }
 

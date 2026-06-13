@@ -3,14 +3,14 @@
 layout(set = 0, binding = 0) uniform GlobalUBO {
     mat4 view;
     mat4 proj;
-    vec4 cameraPos;
-    vec4 lightDir;
-    vec4 lightingPack;   // .x = lightIntensity, .y = prefilterMaxLod, .z..w = 0 (dead)
+    vec4 cameraPos;          // .xyz used, .w reserved (channel-reuse policy)
+    vec4 lightDir;           // .xyz used (negated before NdotL), .w reserved
+    vec4 lightingPack;       // .x = lightIntensity, .y = prefilterMaxLod, .z..w reserved
 } globals;
 
 struct Material {
     vec4 baseColorFactor;
-    vec4 emissiveFactor;     // .rgb used, .w = 0 (std140 alignment pad)
+    vec4 emissiveFactor;     // .rgb used, .w is the std140 alignment pad (NEVER a bit-pack target)
     vec4 factorPack;         // .x = metallicFactor, .y = roughnessFactor, .z = normalScale, .w = occlusionStrength
 };
 
@@ -30,7 +30,7 @@ layout(set = 0, binding = 4) uniform sampler2D uBRDFLUT;
 
 layout(push_constant) uniform PushConstants {
     mat4 model;
-    vec4 tail;   // .x = floatBitsToUint(materialIndex), .yzw = 0 (dead)
+    vec4 tail;   // .x = floatBitsToUint(materialIndex), .yzw reserved (channel-reuse policy)
 } pc;
 
 layout(location = 0) in vec3 vWorldPos;
