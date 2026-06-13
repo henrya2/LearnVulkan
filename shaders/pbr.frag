@@ -4,7 +4,7 @@ layout(set = 0, binding = 0) uniform GlobalUBO {
     mat4 view;
     mat4 proj;
     vec3 cameraPos;
-    float _pad0;
+    float _pad0;            // std140: align next vec3 to 16
     vec3 lightDir;
     float lightIntensity;
     float prefilterMaxLod;
@@ -17,7 +17,6 @@ struct Material {
     float roughnessFactor;
     float normalScale;
     float occlusionStrength;
-    vec4 _pad;
 };
 
 layout(std140, set = 0, binding = 1) uniform MaterialBuffer {
@@ -37,7 +36,6 @@ layout(set = 0, binding = 4) uniform sampler2D uBRDFLUT;
 layout(push_constant) uniform PushConstants {
     mat4 model;
     uint materialIndex;
-    uint _pad1[3];
 } pc;
 
 layout(location = 0) in vec3 vWorldPos;

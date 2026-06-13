@@ -30,6 +30,10 @@ impl PbrMaterial {
     }
 }
 
+/// GPU-side material layout. The `Material` struct in `pbr.frag` is declared
+/// inside a `std140` UBO; as an array element, the array stride must be a
+/// multiple of 16. The struct is 48 B, which is already a multiple of 16, so
+/// no trailing pad member is required.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuMaterial {
@@ -39,8 +43,9 @@ pub struct GpuMaterial {
     pub roughness_factor: f32,
     pub normal_scale: f32,
     pub occlusion_strength: f32,
-    pub _pad: [f32; 4],
 }
+
+const _: () = assert!(std::mem::size_of::<GpuMaterial>() == 48);
 
 impl From<&PbrMaterial> for GpuMaterial {
     fn from(m: &PbrMaterial) -> Self {
@@ -56,7 +61,6 @@ impl From<&PbrMaterial> for GpuMaterial {
             roughness_factor: m.roughness_factor,
             normal_scale: m.normal_scale,
             occlusion_strength: m.occlusion_strength,
-            _pad: [0.0; 4],
         }
     }
 }

@@ -14,7 +14,6 @@ layout(set = 1, binding = 0) uniform PostProcessUBO {
     float bloom_intensity;
     float bloom_weights[8];
     uint  tonemap_op;
-    uint  _pad[3];
 } pp;
 
 layout(location = 0) in vec2 vUV;

@@ -4,7 +4,7 @@ layout(set = 0, binding = 0) uniform GlobalUBO {
     mat4 view;
     mat4 proj;
     vec3 cameraPos;
-    float _pad0;
+    float _pad0;            // std140: align next vec3 to 16
     vec3 lightDir;
     float lightIntensity;
     float prefilterMaxLod;

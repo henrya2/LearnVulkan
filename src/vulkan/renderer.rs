@@ -11,7 +11,7 @@ use crate::vulkan::descriptors::{
     create_material_descriptor_set_layout,
 };
 use crate::vulkan::ibl::IblResources;
-use crate::vulkan::pbr_ubo::{GlobalUniforms, PushConstants};
+use crate::vulkan::pbr_ubo::{GLOBAL_UBO_BLOCK_SIZE, GlobalUniforms, PushConstants};
 use crate::vulkan::pipeline::{
     PipelineData, create_pbr_pipeline, create_skybox_pipeline,
 };
@@ -144,12 +144,16 @@ impl Renderer {
         );
 
         let ubo_size = std::mem::size_of::<GlobalUniforms>() as vk::DeviceSize;
+        // The UBO must be at least GLOBAL_UBO_BLOCK_SIZE bytes (the std140
+        // block size after the GPU rounds the struct up to a multiple of 16)
+        // so reads of the trailing fields don't fault.
+        let alloc_size = GLOBAL_UBO_BLOCK_SIZE.max(ubo_size);
         let mut global_uniforms = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
         let mut global_mapped = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
         for _ in 0..MAX_FRAMES_IN_FLIGHT {
             let buf = create_buffer(
                 &ctx.device,
-                ubo_size,
+                alloc_size,
                 vk::BufferUsageFlags::UNIFORM_BUFFER,
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
                 &ctx.instance,
@@ -157,7 +161,7 @@ impl Renderer {
             );
             let ptr = unsafe {
                 ctx.device
-                    .map_memory(buf.memory, 0, ubo_size, vk::MemoryMapFlags::empty())
+                    .map_memory(buf.memory, 0, alloc_size, vk::MemoryMapFlags::empty())
                     .unwrap()
             } as *mut u8;
             global_uniforms.push(buf);
@@ -178,7 +182,7 @@ impl Renderer {
             let global_buffer_info = vk::DescriptorBufferInfo::default()
                 .buffer(global_uniforms[i].buffer)
                 .offset(0)
-                .range(ubo_size);
+                .range(GLOBAL_UBO_BLOCK_SIZE);
             let material_buffer_info = vk::DescriptorBufferInfo::default()
                 .buffer(scene.material_buffer.buffer)
                 .offset(0)
@@ -621,11 +625,10 @@ impl Renderer {
             view: view.to_cols_array(),
             proj: proj.to_cols_array(),
             camera_pos: [camera_pos.x, camera_pos.y, camera_pos.z],
-            _pad0: 0.0,
+            __pad0: 0.0,
             light_dir: [light_dir.x, light_dir.y, light_dir.z],
             light_intensity: 4.0,
             prefilter_max_lod,
-            _pad1: [0.0; 3],
         };
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -1051,7 +1054,6 @@ fn record_command_buffer(
             let pc = PushConstants {
                 model: mesh.world_matrix.to_cols_array(),
                 material_index: mesh.material_index as u32,
-                _pad: [0; 3],
             };
             let pc_bytes = bytemuck::bytes_of(&pc);
 
@@ -1309,7 +1311,6 @@ unsafe fn record_blur_passes(
             let pc = crate::vulkan::postprocess::BlurPushConstants {
                 texel_size: [1.0 / mip_w as f32, 1.0 / mip_h as f32],
                 direction: 0,
-                _pad: 0,
             };
             let pc_bytes = bytemuck::bytes_of(&pc);
             device.cmd_push_constants(
@@ -1359,7 +1360,6 @@ unsafe fn record_blur_passes(
             let pc2 = crate::vulkan::postprocess::BlurPushConstants {
                 texel_size: [1.0 / mip_w as f32, 1.0 / mip_h as f32],
                 direction: 1,
-                _pad: 0,
             };
             let pc_bytes2 = bytemuck::bytes_of(&pc2);
             device.cmd_push_constants(

@@ -18,8 +18,15 @@ pub const BLOOM_MIP_COUNT: usize = 8;
 /// |--------|-------|-------|
 /// | 0      | 16    | `exposure`, `bloom_threshold`, `bloom_knee`, `bloom_intensity` (vec4) |
 /// | 16     | 128   | `bloom_weights` (8 vec4s — actual weight in slot 0 of each vec4, rest padding) |
-/// | 144    | 16    | `tonemap_op`, `_pad[3]` (vec4) |
+/// | 144    | 4     | `tonemap_op` (uint) |
+/// | 160    |       | (block rounded up to multiple of 16 by std140) |
 /// | total  | 160   | |
+///
+/// The trailing 12 B between `tonemap_op` and the 160 B block end are part of
+/// the std140 block-size round-up to a vec4 boundary. The CPU struct holds
+/// them explicitly as `_pad[3]` so `size_of` matches the GPU's 160 B block;
+/// the GLSL block does not need a corresponding member — std140 rounds the
+/// block size up automatically.
 ///
 /// The 8 logical weights live at `bloom_weights[0]`, `bloom_weights[4]`,
 /// `bloom_weights[8]`, `bloom_weights[12]`, `bloom_weights[16]`,
@@ -45,6 +52,9 @@ pub struct PostProcessUBO {
     /// Offset 16, length 128 bytes.
     pub bloom_weights: [f32; BLOOM_MIP_COUNT * 4],
     pub tonemap_op: u32,          // offset 144 (0=linear, 1=reinhard, 2=aces)
+    /// std140 block-size rounding: the GPU block is rounded up to a multiple
+    /// of 16, so the trailing 12 B must be present on the CPU side. The GLSL
+    /// `PostProcessUBO` block does not declare a corresponding member.
     pub _pad: [u32; 3],           // offset 148
 }
 
@@ -80,18 +90,17 @@ impl Default for PostProcessUBO {
     }
 }
 
-/// Blur push constants: texel size and direction. 12 bytes used, 16 bytes
-/// with trailing padding. Push constants are tightly packed in Vulkan (no
-/// std140 padding), but the trailing `_pad` keeps the CPU struct 16-byte
-/// aligned to match the spec's 16-byte push constant guarantee and to make
-/// `size_of` round to 16.
+/// Blur push constants: texel size and direction. 12 bytes total. Push
+/// constants in Vulkan are tightly packed (no std140 padding); the struct
+/// matches the shader's `BlurPC` block exactly.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct BlurPushConstants {
     pub texel_size: [f32; 2],
     pub direction: i32,
-    pub _pad: i32,
 }
+
+const _: () = assert!(std::mem::size_of::<BlurPushConstants>() == 12);
 
 // Compile-time check: the UBO must match the std140 size the shaders see.
 const _: [(); 160] = [(); std::mem::size_of::<PostProcessUBO>()];
