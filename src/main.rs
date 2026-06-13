@@ -15,6 +15,7 @@ use app::App;
 struct AppHandler {
     app: Option<App>,
     enable_validation: bool,
+    enable_gpu_assisted: bool,
     width: u32,
     height: u32,
 }
@@ -30,7 +31,11 @@ impl ApplicationHandler for AppHandler {
                 .with_title("LearnVulkan - Tonemap: ACES")
                 .with_inner_size(winit::dpi::LogicalSize::new(self.width, self.height));
             let window = event_loop.create_window(attrs).unwrap();
-            self.app = Some(App::new(window, self.enable_validation));
+            self.app = Some(App::new(
+                window,
+                self.enable_validation,
+                self.enable_gpu_assisted,
+            ));
         }
     }
 
@@ -86,6 +91,13 @@ fn main() {
         .any(|arg| arg == "--validation" || arg == "--validate")
         || cfg!(debug_assertions);
 
+    // GPU-assisted validation is opt-in (default off). It requires the
+    // validation layer, so the VulkanContext will silently ignore this flag
+    // if validation is not enabled.
+    let enable_gpu_assisted = args.iter().any(|arg| {
+        arg == "--gpu-assisted" || arg == "--gpu_assisted" || arg == "--vgav"
+    });
+
     let (width, height) = parse_resolution();
 
     let event_loop = EventLoop::new().unwrap();
@@ -93,6 +105,7 @@ fn main() {
     let mut handler = AppHandler {
         app: None,
         enable_validation,
+        enable_gpu_assisted,
         width,
         height,
     };

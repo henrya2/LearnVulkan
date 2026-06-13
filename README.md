@@ -20,7 +20,7 @@ A Vulkan PBR renderer written in Rust. It loads and renders glTF 2.0 models (Dam
 - **Clean Vulkan bring-up** with validation layers in debug builds, plus opt-in validation in non-debug builds with `--validation` / `--validate`
 - **RenderDoc-friendly debug markers** via `VK_EXT_debug_utils` in all builds: labeled frame/render-pass/mesh regions and named GPU resources
 - **HDR bloom**: 8-mip separable Gaussian blur with Frostbite-style soft knee threshold
-- **Runtime-switchable tonemapping**: Linear / Reinhard / ACES with stops-based exposure control
+- **Runtime-switchable tonemapping**: Linear / Reinhard / ACES. Press `T` to cycle the active operator at runtime; the window title updates to `LearnVulkan - Tonemap: <OP>`. The composite shader also takes a stops-based exposure (`pow(2, exposure)`) from the postprocess UBO, currently set at startup.
 - **Skybox rendering** with the environment cubemap (`LESS_OR_EQUAL` depth, depth writes disabled)
 - **Fullscreen-triangle postprocessing framework**: extensible design with shared vertex shader and per-effect fragment shaders
 
@@ -58,6 +58,9 @@ cargo run -- --resolution=1920x1080
 
 # Run a release build with Vulkan validation layers enabled
 cargo run --release -- --resolution=1280x720 --validation
+
+# Run with GPU-assisted validation (requires --validation; opt-in, default off)
+cargo run -- --validation --gpu-assisted
 ```
 
 ## Controls
@@ -70,6 +73,7 @@ cargo run --release -- --resolution=1280x720 --validation
 | Mouse | Look around |
 | Left click | Lock & hide cursor |
 | `Alt` + `Z` | Release cursor lock |
+| `T` | Cycle tonemap: Linear -> Reinhard -> ACES -> Linear |
 | `Alt`+`Tab` / focus loss | Auto-release cursor lock |
 
 ## Project Structure
@@ -92,6 +96,7 @@ LearnVulkan/
 │   ├── glTF_rendering_plan.md # glTF PBR rendering plan
 │   ├── debug_marker_plan.md   # RenderDoc debug marker plan
 │   ├── postprocessing_plan.md # Bloom + tonemapping postprocess design
+│   ├── shader_buffer_mem_layout.md # Project-wide UBO / SSBO / push-constant layout rule (glam::Vec4 base element)
 │   ├── winding_orientation.md # Full winding math (glTF -> Vulkan pipeline)
 │   └── review/                # Code review notes
 ├── shaders/
@@ -136,7 +141,7 @@ LearnVulkan/
             ├── mod.rs          # Re-exports: BloomPyramid, PostProcessResources, etc.
             ├── passes.rs       # Three render passes: HDR scene, color (no depth), composite (sRGB)
             ├── resources.rs    # PostProcessResources: images, views, framebuffers, pipelines, descriptors, UBOs
-            ├── ubo.rs          # PostProcessUBO (160B, std140 with vec4-strided float[8]) + BlurPushConstants (16B)
+            ├── ubo.rs          # PostProcessUBO (64B, std140: 1 Vec4 pack + [Vec4;2] weights + 1 Vec4 pack) + BlurPushConstants (16B Vec4)
             ├── pyramid.rs      # BloomPyramid: 2 images x 8 mips (R16G16B16A16_SFLOAT)
             ├── descriptors.rs  # Postprocess descriptor set layouts: UBO, single-input, composite-input
             ├── fullscreen.rs   # Fullscreen-triangle pipeline builder
@@ -163,11 +168,12 @@ LearnVulkan/
   - Postprocess pipelines use `cull_mode = NONE` (fullscreen triangle is CW under Y-flip viewport).
   - Descriptor sets: set 0 = input samplers (1 for bloom prefilter/blur, 9 for composite), set 1 = postprocess UBO (exposure, bloom parameters, tonemap operator).
   - Adding a new effect: allocate framebuffer + descriptor sets, insert render pass calls in the command buffer.
-- **Skybox:** Unit cube rendered with `LESS_OR_EQUAL` depth test and depth writes disabled, so it only appears where no geometry is drawn. The skybox shader strips view translation (`mat3(view)`) to keep the environment infinitely distant. Share the same `front_face = COUNTER_CLOCKWISE` / `cull_mode = BACK` as PBR; the camera-on-inside produces CCW-in-framebuffer windings (one Y-flip viewport reflection). See `docs/winding_orientation.md` §§S1-S8 for the full derivation.
+- **Skybox:** Unit cube rendered with `LESS_OR_EQUAL` depth test and depth writes disabled, so it only appears where no geometry is drawn. The skybox shader strips view translation (`mat3(view)`) to keep the environment infinitely distant. The skybox is **CW-from-outside in LH world** (the same code-defined geometry rule as the postprocess fullscreen triangle) but is viewed from **inside** the cube, so the pipeline uses `front_face = COUNTER_CLOCKWISE` with `cull_mode = FRONT` — cull the outside (which is front for CW-from-outside) so the inside is visible. See `docs/winding_orientation.md` §§S1-S8 for the full derivation.
 - **Cleanup order:** `Renderer` is dropped before `VulkanContext` via `ManuallyDrop`. Inside the renderer: `device_wait_idle` -> scene -> IBL -> skybox buffers -> skybox pipeline -> global UBOs -> main descriptor pool/layouts -> fences/semaphores -> command pool -> PBR pipeline -> postprocess resources (pipelines, render passes, descriptor pool, bloom pyramid, scene color images) -> swapchain.
 - **Sync strategy:** `MAX_FRAMES_IN_FLIGHT = 2`. `render_finished` semaphores are per-swapchain-image to avoid reuse validation errors.
 - **RenderDoc debug markers:** `VK_EXT_debug_utils` is enabled in all builds. Command buffers contain frame/render-pass/per-mesh label regions (Scene Pass → PostProcessing group containing Bloom Prefilter, Bloom Pyramid, and Composite Pass), and major Vulkan objects are named for RenderDoc resource inspection.
-- **Validation layers:** `VK_LAYER_KHRONOS_validation` is enabled by default in debug builds. In non-debug builds, launch with `--validation` or `--validate` to enable it.
+- **Validation layers:** `VK_LAYER_KHRONOS_validation` is enabled by default in debug builds. In non-debug builds, launch with `--validation` or `--validate` to enable it. **GPU-assisted validation is opt-in (default off)** via `--gpu-assisted` (also `--gpu_assisted`, `--vgav`); pair it with `--validation` to actually enable it. See `CODEBUDDY.md` → **Testing rules** for the rationale.
+- **Shader buffer layout (project rule):** Every UBO / SSBO / push-constant struct (`GlobalUniforms`, `GpuMaterial`, `PushConstants`, `PostProcessUBO`, `BlurPushConstants`) is `#[repr(C)]` + `bytemuck::Pod` + `bytemuck::Zeroable`, with **only** `glam::Mat4`, `glam::Vec4`, or arrays of `glam::Vec4` as fields. Scalar values (u32 / i32 / f32) are bit-packed into `Vec4` channels via `f32::from_bits` on the CPU and `floatBitsToUint` / `uintBitsToFloat` on the GPU. This makes the std140 GPU layout and the Rust `#[repr(C)]` layout trivially equivalent. See `docs/shader_buffer_mem_layout.md` §2 for the full rationale and §10 for the contributor checklist.
 
 ## License
 

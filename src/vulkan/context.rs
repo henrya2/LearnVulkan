@@ -26,9 +26,14 @@ pub struct DebugUtils {
 }
 
 impl VulkanContext {
-    pub fn new(display: DisplayHandle, window: WindowHandle, enable_validation: bool) -> Self {
+    pub fn new(
+        display: DisplayHandle,
+        window: WindowHandle,
+        enable_validation: bool,
+        enable_gpu_assisted: bool,
+    ) -> Self {
         let entry = unsafe { ash::Entry::load() }.unwrap();
-        let instance = create_instance(&entry, display, enable_validation);
+        let instance = create_instance(&entry, display, enable_validation, enable_gpu_assisted);
 
         let debug_utils = if enable_validation {
             Some(create_debug_utils(&entry, &instance))
@@ -84,6 +89,7 @@ fn create_instance(
     entry: &ash::Entry,
     display: DisplayHandle,
     enable_validation: bool,
+    enable_gpu_assisted: bool,
 ) -> ash::Instance {
     let app_name = CString::new("LearnVulkan").unwrap();
     let engine_name = CString::new("NoEngine").unwrap();
@@ -107,15 +113,28 @@ fn create_instance(
         extensions.push(ash::ext::validation_features::NAME.as_ptr());
     }
 
+    // GPU-assisted validation is opt-in via CLI; requires the validation layer.
+    let gpu_assisted_active = enable_validation && enable_gpu_assisted;
+    let enabled_features: &[vk::ValidationFeatureEnableEXT] = if gpu_assisted_active {
+        &[
+            vk::ValidationFeatureEnableEXT::GPU_ASSISTED,
+            vk::ValidationFeatureEnableEXT::GPU_ASSISTED_RESERVE_BINDING_SLOT,
+        ]
+    } else {
+        &[]
+    };
     let mut validation_features = vk::ValidationFeaturesEXT::default()
-        .enabled_validation_features(&[vk::ValidationFeatureEnableEXT::GPU_ASSISTED, vk::ValidationFeatureEnableEXT::GPU_ASSISTED_RESERVE_BINDING_SLOT]);
+        .enabled_validation_features(enabled_features);
 
     let mut create_info = vk::InstanceCreateInfo::default()
         .application_info(&app_info)
         .enabled_extension_names(&extensions)
         .enabled_layer_names(&layer_names);
 
-    if enable_validation {
+    // Only chain ValidationFeaturesEXT when GPU-assisted is requested.
+    // Chaining an empty features list with VK_LAYER_KHRONOS_validation enabled
+    // is allowed but unnecessary; the layer picks sensible defaults.
+    if gpu_assisted_active {
         create_info = create_info.push_next(&mut validation_features);
     }
 

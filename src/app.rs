@@ -37,13 +37,17 @@ impl Drop for App {
 }
 
 impl App {
-    pub fn new(window: Window, enable_validation: bool) -> Self {
+    pub fn new(
+        window: Window,
+        enable_validation: bool,
+        enable_gpu_assisted: bool,
+    ) -> Self {
         let window = Arc::new(window);
 
         let display = window.display_handle().unwrap();
         let win_handle = window.window_handle().unwrap();
 
-        let ctx = VulkanContext::new(display, win_handle, enable_validation);
+        let ctx = VulkanContext::new(display, win_handle, enable_validation, enable_gpu_assisted);
 
         let size = window.inner_size();
         let renderer = Renderer::new(&ctx, size.width, size.height);
