@@ -104,12 +104,20 @@ fn create_instance(
     let mut layer_names = Vec::new();
     if enable_validation {
         layer_names.push(c"VK_LAYER_KHRONOS_validation".as_ptr() as *const c_char);
+        extensions.push(ash::ext::validation_features::NAME.as_ptr());
     }
 
-    let create_info = vk::InstanceCreateInfo::default()
+    let mut validation_features = vk::ValidationFeaturesEXT::default()
+        .enabled_validation_features(&[vk::ValidationFeatureEnableEXT::GPU_ASSISTED, vk::ValidationFeatureEnableEXT::GPU_ASSISTED_RESERVE_BINDING_SLOT]);
+
+    let mut create_info = vk::InstanceCreateInfo::default()
         .application_info(&app_info)
         .enabled_extension_names(&extensions)
         .enabled_layer_names(&layer_names);
+
+    if enable_validation {
+        create_info = create_info.push_next(&mut validation_features);
+    }
 
     unsafe { entry.create_instance(&create_info, None).unwrap() }
 }
