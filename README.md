@@ -136,7 +136,7 @@ LearnVulkan/
             ├── mod.rs          # Re-exports: BloomPyramid, PostProcessResources, etc.
             ├── passes.rs       # Three render passes: HDR scene, color (no depth), composite (sRGB)
             ├── resources.rs    # PostProcessResources: images, views, framebuffers, pipelines, descriptors, UBOs
-            ├── ubo.rs          # PostProcessUBO (64B, std140) + BlurPushConstants (16B)
+            ├── ubo.rs          # PostProcessUBO (160B, std140 with vec4-strided float[8]) + BlurPushConstants (16B)
             ├── pyramid.rs      # BloomPyramid: 2 images x 8 mips (R16G16B16A16_SFLOAT)
             ├── descriptors.rs  # Postprocess descriptor set layouts: UBO, single-input, composite-input
             ├── fullscreen.rs   # Fullscreen-triangle pipeline builder

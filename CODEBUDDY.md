@@ -114,7 +114,7 @@ Procedural mesh helpers:
   - **`passes.rs`**: Three render passes: `create_scene_render_pass` (HDR `R16G16B16A16_SFLOAT` + depth), `create_postprocess_color_pass` (single HDR color attachment, no depth, used by bright + blur), `create_composite_render_pass` (sRGB swapchain format, final present).
   - **`fullscreen.rs`**: `create_fullscreen_pipeline(device, render_pass, layout, frag_code)` builds a fullscreen-triangle pipeline with `cull_mode = NONE` (fullscreen triangle is CW in framebuffer under Y-flip viewport). Shared vertex shader (`fullscreen.vert`) generates triangle from `gl_VertexIndex`.
   - **`descriptors.rs`**: Three descriptor set layouts: UBO (set 1 for all passes), single-input sampler (set 0 for bright + blur), composite-input (set 0 with 9 bindings: scene color + 8 bloom mips).
-  - **`ubo.rs`**: `PostProcessUBO` (64 B, std140): exposure, bloom threshold/knee/intensity, 8 bloom weights, tonemap_op. `BlurPushConstants` (16 B): `[texel_size, direction, _pad]`.
+  - **`ubo.rs`**: `PostProcessUBO` (160 B, std140): exposure, bloom threshold/knee/intensity, 8 bloom weights, tonemap_op. The 8 weights are stored as `[f32; 32]` (vec4-strided per the std140 `float[8]` rule); use `set_bloom_weights(&[f32; 8])` to write logical weights. `BlurPushConstants` (16 B): `[texel_size, direction, _pad]`.
   - **`pyramid.rs`**: `BloomPyramid` — 2 single images (`mip` + `temp`) with `BLOOM_MIP_COUNT=8` mip levels each. Per-level views created with `base_mip_level = i`. One `vk::Sampler` (CLAMP_TO_EDGE, LINEAR, no mip).
   - **`resources.rs`**: `PostProcessResources` — owns all postprocess device objects (images, views, framebuffers, pipelines, descriptor pool/sets, UBOs). The composite render pass is owned by `Renderer` and passed in; PostProcessResources does not create or destroy it. `PostProcessSettings` wraps `PostProcessUBO` + `bloom_enabled: bool`. `name_debug_objects` installs RenderDoc names.
   - **`pass_trait.rs`**: `set_viewport_and_bind_pipeline` helper enforces Y-flip viewport + scissor + pipeline bind in every pass. New effects can use this helper directly when recording their render pass.
@@ -142,7 +142,7 @@ Procedural mesh helpers:
   - `images_in_flight` fences track which frame is using each swapchain image
   - Swapchain is recreated lazily on resize or `SUBOPTIMAL_KHR`/`ERROR_OUT_OF_DATE_KHR`
   - **Per-frame global UBO**: one `HOST_VISIBLE | HOST_COHERENT` buffer per frame, 176 B, persistently mapped. `memcpy` of `GlobalUniforms` happens after the frame's `in_flight` fence wait, before submit.
-  - **Postprocess UBO**: separate `HOST_VISIBLE | HOST_COHERENT` buffer per frame, 64 B. `memcpy` of `PostProcessUBO` from `PostProcessSettings` happens in the same pre-submit window.
+  - **Postprocess UBO**: separate `HOST_VISIBLE | HOST_COHERENT` buffer per frame, 160 B. `memcpy` of `PostProcessUBO` from `PostProcessSettings` happens in the same pre-submit window.
   - Global descriptor set (set 0) bound once per command buffer; per-material descriptor set (set 1) bound per mesh draw call.
   - Postprocess pipelines use their own descriptor sets (set 0 = input samplers, set 1 = UBO), independent of the PBR pipeline layouts.
   - Push constants updated per mesh draw call with model matrix and material index.

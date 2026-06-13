@@ -1,10 +1,39 @@
 use bytemuck::{Pod, Zeroable};
 
+/// Number of mips in the bloom pyramid. Each mip is weighted by
+/// `bloom_weights[i]` in the composite shader. See `BloomPyramid::MIP_COUNT`.
+pub const BLOOM_MIP_COUNT: usize = 8;
+
 /// Per-frame postprocess uniform, shared across bright, blur, and composite
 /// fragment shaders. Each shader uses a subset of the fields.
 ///
-/// std140 layout: float[8] aligns to 16, so `bloom_weights` starts at offset 16.
-/// `tonemap_op` + `_pad` occupy 16 bytes at offset 48. Total: 64 bytes.
+/// # std140 layout (must match the GLSL `PostProcessUBO` declarations)
+///
+/// GLSL with no explicit block layout uses std140 in Vulkan. In std140, a
+/// `float[N]` array is laid out like `vec4[N]` (each element aligned to a
+/// vec4 boundary), so the array occupies `N * 16` bytes and individual
+/// elements are 16 bytes apart. The full struct therefore occupies 160 bytes:
+///
+/// | Offset | Bytes | Field |
+/// |--------|-------|-------|
+/// | 0      | 16    | `exposure`, `bloom_threshold`, `bloom_knee`, `bloom_intensity` (vec4) |
+/// | 16     | 128   | `bloom_weights` (8 vec4s — actual weight in slot 0 of each vec4, rest padding) |
+/// | 144    | 16    | `tonemap_op`, `_pad[3]` (vec4) |
+/// | total  | 160   | |
+///
+/// The 8 logical weights live at `bloom_weights[0]`, `bloom_weights[4]`,
+/// `bloom_weights[8]`, `bloom_weights[12]`, `bloom_weights[16]`,
+/// `bloom_weights[20]`, `bloom_weights[24]`, `bloom_weights[28]`. Use
+/// [`PostProcessUBO::set_bloom_weights`] to write the logical weights; the
+/// padding slots will be zeroed. (Strictly only the weight slots need to be
+/// set, but zeroing the padding is harmless and keeps the UBO dump tidy.)
+///
+/// References:
+/// - Vulkan Guide, *Shader Memory Layout / Standard Buffer Layout*,
+///   §"std140 Layout" — <https://docs.vulkan.org/guide/latest/shader_memory_layout.html>
+/// - Vulkan Spec, *Offset and Stride Assignment* — `float[N]` has base
+///   alignment 16 in std140
+///   <https://docs.vulkan.org/spec/latest/chapters/interfaces.html#interfaces-resources-standard-layout>
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct PostProcessUBO {
@@ -12,30 +41,81 @@ pub struct PostProcessUBO {
     pub bloom_threshold: f32,     // offset 4
     pub bloom_knee: f32,          // offset 8
     pub bloom_intensity: f32,     // offset 12
-    pub bloom_weights: [f32; 8],  // offset 16
-    pub tonemap_op: u32,          // offset 48 (0=linear, 1=reinhard, 2=aces)
-    pub _pad: [u32; 3],           // offset 52
+    /// std140 `float[8]` packed as 8 vec4s. Use [`Self::set_bloom_weights`].
+    /// Offset 16, length 128 bytes.
+    pub bloom_weights: [f32; BLOOM_MIP_COUNT * 4],
+    pub tonemap_op: u32,          // offset 144 (0=linear, 1=reinhard, 2=aces)
+    pub _pad: [u32; 3],           // offset 148
 }
 
-impl Default for PostProcessUBO {
-    fn default() -> Self {
-        Self {
-            exposure: 0.0,
-            bloom_threshold: 1.0,
-            bloom_knee: 0.5,
-            bloom_intensity: 0.04,
-            bloom_weights: [0.4, 0.3, 0.25, 0.2, 0.15, 0.1, 0.05, 0.025],
-            tonemap_op: 2, // ACES
-            _pad: [0; 3],
+impl PostProcessUBO {
+    /// Set the 8 logical bloom weights, scattering them into the std140
+    /// vec4-strided slots and zeroing the padding.
+    pub fn set_bloom_weights(&mut self, weights: &[f32; BLOOM_MIP_COUNT]) {
+        for i in 0..BLOOM_MIP_COUNT {
+            self.bloom_weights[i * 4] = weights[i];
+            // Zero the three padding floats that follow each weight in std140.
+            self.bloom_weights[i * 4 + 1] = 0.0;
+            self.bloom_weights[i * 4 + 2] = 0.0;
+            self.bloom_weights[i * 4 + 3] = 0.0;
         }
     }
 }
 
-/// Blur push constants: texel size and direction. 12 bytes.
+impl Default for PostProcessUBO {
+    fn default() -> Self {
+        let mut ubo = Self {
+            exposure: 0.0,
+            bloom_threshold: 1.0,
+            bloom_knee: 0.5,
+            bloom_intensity: 0.04,
+            bloom_weights: [0.0; BLOOM_MIP_COUNT * 4],
+            tonemap_op: 2, // ACES
+            _pad: [0; 3],
+        };
+        // Approximate Gaussian weights (sum = 1.225, not normalised on purpose
+        // — the bloom intensity is a separate global multiplier).
+        ubo.set_bloom_weights(&[0.4, 0.3, 0.25, 0.2, 0.15, 0.1, 0.05, 0.025]);
+        ubo
+    }
+}
+
+/// Blur push constants: texel size and direction. 12 bytes used, 16 bytes
+/// with trailing padding. Push constants are tightly packed in Vulkan (no
+/// std140 padding), but the trailing `_pad` keeps the CPU struct 16-byte
+/// aligned to match the spec's 16-byte push constant guarantee and to make
+/// `size_of` round to 16.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct BlurPushConstants {
     pub texel_size: [f32; 2],
     pub direction: i32,
     pub _pad: i32,
+}
+
+// Compile-time check: the UBO must match the std140 size the shaders see.
+const _: [(); 160] = [(); std::mem::size_of::<PostProcessUBO>()];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn postprocess_ubo_is_160_bytes() {
+        assert_eq!(std::mem::size_of::<PostProcessUBO>(), 160);
+    }
+
+    #[test]
+    fn set_bloom_weights_places_values_at_stride_16_offsets() {
+        let mut ubo = PostProcessUBO::default();
+        ubo.set_bloom_weights(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        // Each weight at index i*4, padding zeros in i*4+1..i*4+3.
+        for i in 0..BLOOM_MIP_COUNT {
+            let base = i * 4;
+            assert_eq!(ubo.bloom_weights[base], (i + 1) as f32);
+            assert_eq!(ubo.bloom_weights[base + 1], 0.0);
+            assert_eq!(ubo.bloom_weights[base + 2], 0.0);
+            assert_eq!(ubo.bloom_weights[base + 3], 0.0);
+        }
+    }
 }
