@@ -29,7 +29,7 @@ pub enum TonemapOp {
 impl TonemapOp {
     /// Cycle to the next operator in the canonical order
     /// Linear -> Reinhard -> ACES -> Linear. The numeric value of each
-    /// variant is what gets written to `PostProcessUBO::tonemap_op` and read
+    /// variant is what gets written to `PostProcessUBO::set_tonemap_op` and read
     /// by the composite shader's `if/else` chain.
     pub fn next(self) -> Self {
         match self {
@@ -629,7 +629,7 @@ impl PostProcessResources {
     pub fn update_ubo(&self, frame: usize) {
         let mut ubo = self.settings.ubo;
         if !self.settings.bloom_enabled {
-            ubo.bloom_intensity = 0.0;
+            ubo.set_bloom_intensity(0.0);
         }
         unsafe {
             std::ptr::copy_nonoverlapping(

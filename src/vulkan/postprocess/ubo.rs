@@ -1,49 +1,50 @@
 use bytemuck::{Pod, Zeroable};
+use glam::Vec4;
 
 /// Number of mips in the bloom pyramid. Each mip is weighted by
 /// `bloom_weights[i]` in the composite shader. See `BloomPyramid::MIP_COUNT`.
 pub const BLOOM_MIP_COUNT: usize = 8;
 
-/// Per-frame postprocess uniform, shared across bright, blur, and composite
-/// fragment shaders. Each shader uses a subset of the fields.
+/// Per-frame postprocess uniform, shared across bright, blur, and
+/// composite fragment shaders. Each shader uses a subset of the fields.
 ///
-/// # std140 layout (must match the GLSL `PostProcessUBO` declarations)
+/// # Layout (must match the GLSL `PostProcessUBO` declarations)
 ///
-/// All three postprocess shaders (`bright.frag`, `blur.frag`, `composite.frag`)
-/// declare the block identically: a leading vec4 of scalar controls followed
-/// by `vec4 bloom_weights[2]`. In std140, `vec4[2]` is 16-byte-aligned and
-/// occupies 32 B starting at offset 16.
+/// The block is a flat sequence of `Vec4` and `[Vec4; 2]` fields —
+/// the project-wide Vec4-base-element rule. There is no `_pad`
+/// field: the trailing `tonemap_pack` provides the std140 block
+/// round-up automatically.
 ///
-/// | Offset | Bytes | Field |
-/// |--------|-------|-------|
-/// | 0      | 16    | `exposure`, `bloom_threshold`, `bloom_knee`, `bloom_intensity` (vec4) |
-/// | 16     | 32    | `bloom_weights` (2 vec4s — 8 logical weights packed in .x..w) |
-/// | 48     | 4     | `tonemap_op` (uint) |
-/// | 52     | 12    | `_pad[3]` (std140 block-size round-up to 64) |
-/// | total  | 64    | |
+/// | Offset | Bytes | Field | Notes |
+/// |--------|-------|-------|-------|
+/// | 0      | 16    | `exposure_pack`       | `.x`=exposure, `.y`=bloom_threshold, `.z`=bloom_knee, `.w`=bloom_intensity |
+/// | 16     | 32    | `bloom_weights[2]`    | 8 logical weights packed in `.xyzw` of each |
+/// | 48     | 16    | `tonemap_pack`        | `.x`=tonemap_op (uint via `f32::from_bits`), `.yz`=0 (dead), `.w`=std140 block round-up |
+/// | total  | 64    |                       | |
 ///
 /// References:
 /// - Vulkan Guide, *Shader Memory Layout / Standard Buffer Layout*,
 ///   §"std140 Layout" — <https://docs.vulkan.org/guide/latest/shader_memory_layout.html>
-/// - Vulkan Spec, *Offset and Stride Assignment* — `float[N]` has base
-///   alignment 16 in std140
+/// - Vulkan Spec, *Standard Buffer Layout* —
 ///   <https://docs.vulkan.org/spec/latest/chapters/interfaces.html#interfaces-resources-standard-layout>
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct PostProcessUBO {
-    pub exposure: f32,            // offset 0
-    pub bloom_threshold: f32,     // offset 4
-    pub bloom_knee: f32,          // offset 8
-    pub bloom_intensity: f32,     // offset 12
-    pub bloom_weights: [glam::Vec4; BLOOM_MIP_COUNT / 4], // offset 16, 32 B
-    pub tonemap_op: u32,          // offset 48 (0=linear, 1=reinhard, 2=aces)
-    /// std140 block-size rounding: the GPU block is rounded up to a multiple
-    /// of 16, so the trailing 12 B must be present on the CPU side. The GLSL
-    /// `PostProcessUBO` block does not declare a corresponding member.
-    pub _pad: [u32; 3],           // offset 52
+    /// `.x` = exposure (stops), `.y` = bloom_threshold, `.z` = bloom_knee,
+    /// `.w` = bloom_intensity.
+    pub exposure_pack: Vec4,
+    /// 8 bloom weights, 4 per `Vec4` channel (`.xyzw`).
+    pub bloom_weights: [Vec4; BLOOM_MIP_COUNT / 4],
+    /// `.x` = tonemap_op (bit-packed `u32` via `f32::from_bits`).
+    /// 0 = linear, 1 = Reinhard, 2 = ACES. `.yz` = 0 (dead),
+    /// `.w` = std140 block round-up.
+    pub tonemap_pack: Vec4,
 }
 
 impl PostProcessUBO {
+    /// Pack 8 logical weights into the 2 `Vec4`s. Weights are
+    /// interpreted 4-per-element in order: `weights[0..4]` go into
+    /// `bloom_weights[0]`, `weights[4..8]` into `bloom_weights[1]`.
     pub fn set_bloom_weights(&mut self, weights: &[f32; BLOOM_MIP_COUNT]) {
         for i in 0..(BLOOM_MIP_COUNT / 4) {
             self.bloom_weights[i].x = weights[i * 4 + 0];
@@ -52,19 +53,91 @@ impl PostProcessUBO {
             self.bloom_weights[i].w = weights[i * 4 + 3];
         }
     }
+
+    /// Exposure in stops. Applied as `pow(2, exposure)` in the
+    /// composite shader.
+    #[inline]
+    #[allow(dead_code)]
+    pub fn set_exposure(&mut self, v: f32) {
+        self.exposure_pack.x = v;
+    }
+
+    /// See [`Self::set_exposure`].
+    #[inline]
+    #[allow(dead_code)]
+    pub fn exposure(&self) -> f32 {
+        self.exposure_pack.x
+    }
+
+    /// Soft-knee threshold (Frostbite style).
+    #[inline]
+    pub fn set_bloom_threshold(&mut self, v: f32) {
+        self.exposure_pack.y = v;
+    }
+
+    /// See [`Self::set_bloom_threshold`].
+    #[inline]
+    #[allow(dead_code)]
+    pub fn bloom_threshold(&self) -> f32 {
+        self.exposure_pack.y
+    }
+
+    /// Knee width, fraction of `bloom_threshold`.
+    #[inline]
+    pub fn set_bloom_knee(&mut self, v: f32) {
+        self.exposure_pack.z = v;
+    }
+
+    /// See [`Self::set_bloom_knee`].
+    #[inline]
+    #[allow(dead_code)]
+    pub fn bloom_knee(&self) -> f32 {
+        self.exposure_pack.z
+    }
+
+    /// Bloom intensity multiplier applied after the weighted sum.
+    #[inline]
+    pub fn set_bloom_intensity(&mut self, v: f32) {
+        self.exposure_pack.w = v;
+    }
+
+    /// See [`Self::set_bloom_intensity`].
+    #[inline]
+    #[allow(dead_code)]
+    pub fn bloom_intensity(&self) -> f32 {
+        self.exposure_pack.w
+    }
+
+    /// Tonemap operator. The shader's `if/else` chain picks
+    /// `0 = linear/none`, `1 = Reinhard`, `2 = ACES`.
+    /// On the CPU the `u32` is bit-packed into `tonemap_pack.x`
+    /// via `f32::from_bits`; the GPU reads it back with
+    /// `floatBitsToUint(pp.tonemap_pack.x)`.
+    #[inline]
+    pub fn set_tonemap_op(&mut self, v: u32) {
+        self.tonemap_pack.x = f32::from_bits(v);
+    }
+
+    /// See [`Self::set_tonemap_op`].
+    #[inline]
+    #[allow(dead_code)]
+    pub fn tonemap_op(&self) -> u32 {
+        self.tonemap_pack.x.to_bits()
+    }
 }
 
 impl Default for PostProcessUBO {
     fn default() -> Self {
         let mut ubo = Self {
-            exposure: 0.0,
-            bloom_threshold: 1.0,
-            bloom_knee: 0.5,
-            bloom_intensity: 0.04,
-            bloom_weights: [glam::Vec4::ZERO; BLOOM_MIP_COUNT / 4],
-            tonemap_op: 2, // ACES
-            _pad: [0; 3],
+            exposure_pack: Vec4::ZERO,
+            bloom_weights: [Vec4::ZERO; BLOOM_MIP_COUNT / 4],
+            tonemap_pack: Vec4::ZERO,
         };
+        // Canonical defaults.
+        ubo.set_bloom_threshold(1.0);
+        ubo.set_bloom_knee(0.5);
+        ubo.set_bloom_intensity(0.04);
+        ubo.set_tonemap_op(2); // ACES
         // Approximate Gaussian weights (sum = 1.225, not normalised on purpose
         // — the bloom intensity is a separate global multiplier).
         ubo.set_bloom_weights(&[0.4, 0.3, 0.25, 0.2, 0.15, 0.1, 0.05, 0.025]);
@@ -72,17 +145,62 @@ impl Default for PostProcessUBO {
     }
 }
 
-/// Blur push constants: texel size and direction. 12 bytes total. Push
-/// constants in Vulkan are tightly packed (no std140 padding); the struct
-/// matches the shader's `BlurPC` block exactly.
+/// Blur push constants. Vulkan push constants are tightly packed
+/// (no std140), but the project still applies the Vec4-base-element
+/// rule: the struct is a single `Vec4` whose `.xy` channels carry
+/// the texel size and whose `.z` channel carries the bit-packed
+/// `i32` direction. `.w` is dead on both sides.
+///
+/// The shader side declares:
+/// ```glsl
+/// layout(push_constant) uniform BlurPC {
+///     vec4 params;   // .xy = uTexelSize, .z = intBitsToFloat(uDirection)
+/// } pc;
+/// ```
+///
+/// Total struct size: 16 B (one `Vec4`). Vulkan's push-constant range
+/// is set to this size; only the first 12 B carry meaningful data on
+/// the GPU, but the extra 4 B are harmless.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct BlurPushConstants {
-    pub texel_size: [f32; 2],
-    pub direction: i32,
+    /// `.xy` = `texel_size` (1.0 / input image extent).
+    /// `.z` = `direction` (bit-packed `i32` via `f32::from_bits`).
+    /// `.w` = 0 (dead).
+    pub params: Vec4,
 }
 
-const _: () = assert!(std::mem::size_of::<BlurPushConstants>() == 12);
+impl BlurPushConstants {
+    /// `1.0 / extent` of the input image in each axis.
+    #[inline]
+    pub fn set_texel_size(&mut self, x: f32, y: f32) {
+        self.params.x = x;
+        self.params.y = y;
+    }
+
+    /// See [`Self::set_texel_size`].
+    #[inline]
+    #[allow(dead_code)]
+    pub fn texel_size(&self) -> [f32; 2] {
+        [self.params.x, self.params.y]
+    }
+
+    /// `0` = horizontal, `1` = vertical. The `i32` is bit-packed into
+    /// `params.z`; the GPU reads `intBitsToFloat(pc.params.z)`.
+    #[inline]
+    pub fn set_direction(&mut self, v: i32) {
+        self.params.z = f32::from_bits(v as u32);
+    }
+
+    /// See [`Self::set_direction`].
+    #[inline]
+    #[allow(dead_code)]
+    pub fn direction(&self) -> i32 {
+        self.params.z.to_bits() as i32
+    }
+}
+
+const _: () = assert!(std::mem::size_of::<BlurPushConstants>() == 16);
 
 // Compile-time check: the UBO must match the std140 size the shaders see.
 const _: [(); 64] = [(); std::mem::size_of::<PostProcessUBO>()];
@@ -109,5 +227,23 @@ mod tests {
         assert_eq!(ubo.bloom_weights[1].y, 6.0);
         assert_eq!(ubo.bloom_weights[1].z, 7.0);
         assert_eq!(ubo.bloom_weights[1].w, 8.0);
+    }
+
+    #[test]
+    fn tonemap_op_round_trips_through_bit_cast() {
+        let mut ubo = PostProcessUBO::default();
+        for v in [0u32, 1, 2, 42, u32::MAX] {
+            ubo.set_tonemap_op(v);
+            assert_eq!(ubo.tonemap_op(), v);
+        }
+    }
+
+    #[test]
+    fn blur_push_direction_round_trips_through_bit_cast() {
+        let mut pc = BlurPushConstants { params: Vec4::ZERO };
+        for v in [0i32, 1, -1, i32::MIN, i32::MAX] {
+            pc.set_direction(v);
+            assert_eq!(pc.direction(), v);
+        }
     }
 }

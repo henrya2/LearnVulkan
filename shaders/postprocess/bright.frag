@@ -8,12 +8,9 @@
 layout(set = 0, binding = 0) uniform sampler2D uSceneColor;
 
 layout(set = 1, binding = 0) uniform PostProcessUBO {
-    float exposure;
-    float bloom_threshold;
-    float bloom_knee;
-    float bloom_intensity;
-    vec4 bloom_weights[2];
-    uint  tonemap_op;
+    vec4 exposurePack;        // .x = exposure, .y = bloom_threshold, .z = bloom_knee, .w = bloom_intensity
+    vec4 bloom_weights[2];    // 8 logical weights packed in .xyzw of each
+    vec4 tonemapPack;         // .x = floatBitsToUint(tonemap_op), .yzw = 0 (dead)
 } pp;
 
 layout(location = 0) in vec2 vUV;
@@ -25,8 +22,8 @@ void main() {
     vec3 color = texture(uSceneColor, uv).rgb;
 
     float brightness = max(max(color.r, color.g), color.b);
-    float threshold = pp.bloom_threshold;
-    float knee = pp.bloom_knee * threshold + 1e-5;
+    float threshold = pp.exposurePack.y;
+    float knee = pp.exposurePack.z * threshold + 1e-5;
 
     // Frostbite-style soft threshold.
     float soft = brightness - threshold + knee;

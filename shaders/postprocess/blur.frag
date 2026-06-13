@@ -6,17 +6,13 @@
 layout(set = 0, binding = 0) uniform sampler2D uInput;
 
 layout(set = 1, binding = 0) uniform PostProcessUBO {
-    float exposure;
-    float bloom_threshold;
-    float bloom_knee;
-    float bloom_intensity;
-    vec4 bloom_weights[2];
-    uint  tonemap_op;
+    vec4 exposurePack;        // .x = exposure, .y = bloom_threshold, .z = bloom_knee, .w = bloom_intensity
+    vec4 bloom_weights[2];    // 8 logical weights packed in .xyzw of each
+    vec4 tonemapPack;         // .x = floatBitsToUint(tonemap_op), .yzw = 0 (dead)
 } pp;
 
 layout(push_constant) uniform BlurPC {
-    vec2 uTexelSize;  // 1.0 / extent of the input image
-    int  uDirection;  // 0 = horizontal, 1 = vertical
+    vec4 params;   // .xy = uTexelSize, .z = intBitsToFloat(uDirection), .w = 0 (dead)
 } pc;
 
 layout(location = 0) in vec2 vUV;
@@ -31,9 +27,9 @@ const float W4 = 0.016216;
 
 void main() {
     vec2 uv = vec2(vUV.x, 1.0 - vUV.y);
-    vec2 step = (pc.uDirection == 0)
-        ? vec2(pc.uTexelSize.x, 0.0)
-        : vec2(0.0, pc.uTexelSize.y);
+    vec2 step = (floatBitsToInt(pc.params.z) == 0)
+        ? vec2(pc.params.x, 0.0)
+        : vec2(0.0, pc.params.y);
 
     vec3 color = texture(uInput, uv).rgb * W0;
     color += texture(uInput, uv + step * 1.0).rgb * W1;

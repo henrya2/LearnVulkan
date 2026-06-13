@@ -5,17 +5,13 @@ layout(set = 0, binding = 0) uniform GlobalUBO {
     mat4 proj;
     vec4 cameraPos;
     vec4 lightDir;
-    float lightIntensity;
-    float prefilterMaxLod;
+    vec4 lightingPack;   // .x = lightIntensity, .y = prefilterMaxLod, .z..w = 0 (dead)
 } globals;
 
 struct Material {
     vec4 baseColorFactor;
-    vec4 emissiveFactor;
-    float metallicFactor;
-    float roughnessFactor;
-    float normalScale;
-    float occlusionStrength;
+    vec4 emissiveFactor;     // .rgb used, .w = 0 (std140 alignment pad)
+    vec4 factorPack;         // .x = metallicFactor, .y = roughnessFactor, .z = normalScale, .w = occlusionStrength
 };
 
 layout(std140, set = 0, binding = 1) uniform MaterialBuffer {
@@ -34,7 +30,7 @@ layout(set = 0, binding = 4) uniform sampler2D uBRDFLUT;
 
 layout(push_constant) uniform PushConstants {
     mat4 model;
-    uint materialIndex;
+    vec4 tail;   // .x = floatBitsToUint(materialIndex), .yzw = 0 (dead)
 } pc;
 
 layout(location = 0) in vec3 vWorldPos;
@@ -81,19 +77,19 @@ vec3 fresnelSchlickRoughness(float cosTheta, vec3 F0, float roughness) {
 }
 
 void main() {
-    Material mat = materialBuffer.materials[pc.materialIndex];
+    Material mat = materialBuffer.materials[floatBitsToUint(pc.tail.x)];
 
     vec4 baseColorSample = texture(uBaseColor, vUV);
     vec3 baseColor = baseColorSample.rgb * mat.baseColorFactor.rgb;
     float alpha = baseColorSample.a * mat.baseColorFactor.a;
 
     vec4 mrSample = texture(uMetallicRoughness, vUV);
-    float metallic = clamp(mrSample.b * mat.metallicFactor, 0.0, 1.0);
-    float roughness = clamp(mrSample.g * mat.roughnessFactor, 0.045, 1.0);
+    float metallic = clamp(mrSample.b * mat.factorPack.x, 0.0, 1.0);
+    float roughness = clamp(mrSample.g * mat.factorPack.y, 0.045, 1.0);
 
     vec3 normalSample = texture(uNormal, vUV).rgb;
     normalSample = normalSample * 2.0 - 1.0;
-    normalSample = normalize(vec3(normalSample.xy * mat.normalScale, normalSample.z));
+    normalSample = normalize(vec3(normalSample.xy * mat.factorPack.z, normalSample.z));
 
     vec3 N = normalize(vNormal);
     vec3 T = normalize(vTangent.xyz);
@@ -103,11 +99,11 @@ void main() {
     N = normalize(TBN * normalSample);
 
     float aoSample = texture(uOcclusion, vUV).r;
-    float occlusion = mix(1.0, aoSample, clamp(mat.occlusionStrength, 0.0, 1.0));
+    float occlusion = mix(1.0, aoSample, clamp(mat.factorPack.w, 0.0, 1.0));
     vec3 emissive = texture(uEmissive, vUV).rgb * mat.emissiveFactor.rgb;
 
     vec3 V = normalize(globals.cameraPos.xyz - vWorldPos);
-    vec3 L = normalize(-globals.lightDir);
+    vec3 L = normalize(-globals.lightDir.xyz);
     vec3 H = normalize(V + L);
 
     float NdotL = max(dot(N, L), 0.0);
@@ -127,7 +123,7 @@ void main() {
     vec3 kD = (vec3(1.0) - kS) * (1.0 - metallic);
 
     vec3 lightColor = vec3(1.0, 0.98, 0.95);
-    vec3 Lo = (kD * baseColor / PI + specular) * NdotL * globals.lightIntensity * lightColor;
+    vec3 Lo = (kD * baseColor / PI + specular) * NdotL * globals.lightingPack.x * lightColor;
 
     // Split-sum IBL
     vec3 F_ambient = fresnelSchlickRoughness(NdotV, F0, roughness);
@@ -140,8 +136,8 @@ void main() {
     // Specular IBL
     vec3 R = reflect(-V, N);
     // The prefilter chain may have any number of mip levels; the renderer
-    // reports `mip_levels - 1` as `globals.prefilterMaxLod`.
-    vec3 prefilteredColor = textureLod(uPrefilterMap, R, roughness * globals.prefilterMaxLod).rgb;
+    // reports `mip_levels - 1` as `globals.lightingPack.y`.
+    vec3 prefilteredColor = textureLod(uPrefilterMap, R, roughness * globals.lightingPack.y).rgb;
     vec2 brdf = texture(uBRDFLUT, vec2(NdotV, roughness)).rg;
     vec3 specular_ibl = prefilteredColor * (F_ambient * brdf.x + brdf.y);
 

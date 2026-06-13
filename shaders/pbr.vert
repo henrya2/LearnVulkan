@@ -5,13 +5,12 @@ layout(set = 0, binding = 0) uniform GlobalUBO {
     mat4 proj;
     vec4 cameraPos;
     vec4 lightDir;
-    float lightIntensity;
-    float prefilterMaxLod;
+    vec4 lightingPack;   // .x = lightIntensity, .y = prefilterMaxLod, .z..w = 0 (dead)
 } globals;
 
 layout(push_constant) uniform PushConstants {
     mat4 model;
-    uint materialIndex;
+    vec4 tail;   // .x = floatBitsToUint(materialIndex), .yzw = 0 (dead)
 } pc;
 
 layout(location = 0) in vec3 inPos;

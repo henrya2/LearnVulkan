@@ -18,12 +18,9 @@ layout(set = 0, binding = 7) uniform sampler2D uBloom6;
 layout(set = 0, binding = 8) uniform sampler2D uBloom7;
 
 layout(set = 1, binding = 0) uniform PostProcessUBO {
-    float exposure;
-    float bloom_threshold;
-    float bloom_knee;
-    float bloom_intensity;
-    vec4 bloom_weights[2];
-    uint  tonemap_op;
+    vec4 exposurePack;        // .x = exposure, .y = bloom_threshold, .z = bloom_knee, .w = bloom_intensity
+    vec4 bloom_weights[2];    // 8 logical weights packed in .xyzw of each
+    vec4 tonemapPack;         // .x = floatBitsToUint(tonemap_op), .yzw = 0 (dead)
 } pp;
 
 layout(location = 0) in vec2 vUV;
@@ -118,16 +115,16 @@ void main() {
     bloom += texture(uBloom5, uv).rgb * pp.bloom_weights[1].g;
     bloom += texture(uBloom6, uv).rgb * pp.bloom_weights[1].b;
     bloom += texture(uBloom7, uv).rgb * pp.bloom_weights[1].a;
-    bloom *= pp.bloom_intensity;
+    bloom *= pp.exposurePack.w;
 
     vec3 color = scene + bloom;
     // Exposure: positive stops brighten, negative stops darken.
-    color *= pow(2.0, pp.exposure);
+    color *= pow(2.0, pp.exposurePack.x);
 
     vec3 mapped;
-    if (pp.tonemap_op == 1u) {
+    if (floatBitsToUint(pp.tonemapPack.x) == 1u) {
         mapped = reinhardJodie(color);
-    } else if (pp.tonemap_op == 2u) {
+    } else if (floatBitsToUint(pp.tonemapPack.x) == 2u) {
         mapped = aces(color);
     } else {
         // 0 = linear / none. Useful for debug: shows raw HDR (clipped to LDR).

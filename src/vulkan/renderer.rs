@@ -441,7 +441,7 @@ impl Renderer {
     pub fn set_tonemap(&mut self, op: TonemapOp) {
         self.current_tonemap = op;
         if let Some(pp) = self.postprocess.as_mut() {
-            pp.settings.ubo.tonemap_op = op.as_u32();
+            pp.settings.ubo.set_tonemap_op(op.as_u32());
         }
     }
 
@@ -649,15 +649,15 @@ impl Renderer {
 
         let light_dir = glam::Vec3::new(-0.5, -1.0, 0.5).normalize();
         let prefilter_max_lod = (self.ibl.prefilter_map.mip_levels.saturating_sub(1)) as f32;
-        let globals = GlobalUniforms {
+        let mut globals = GlobalUniforms {
             view: view,
             proj: proj,
             camera_pos: glam::Vec4::new(camera_pos.x, camera_pos.y, camera_pos.z, 1.0),
             light_dir: glam::Vec4::new(light_dir.x, light_dir.y, light_dir.z, 0.0),
-            light_intensity: 4.0,
-            prefilter_max_lod,
-            _pad_tail: [0.0, 0.0],
+            lighting_pack: glam::Vec4::ZERO,
         };
+        globals.set_light_intensity(4.0);
+        globals.set_prefilter_max_lod(prefilter_max_lod);
         unsafe {
             std::ptr::copy_nonoverlapping(
                 bytemuck::bytes_of(&globals).as_ptr(),
@@ -809,7 +809,7 @@ impl Renderer {
         // must overwrite that with the value the user picked so a window
         // resize doesn't silently switch them back to ACES.
         if let Some(pp) = self.postprocess.as_mut() {
-            pp.settings.ubo.tonemap_op = self.current_tonemap.as_u32();
+            pp.settings.ubo.set_tonemap_op(self.current_tonemap.as_u32());
         }
 
         { let dm = &ctx.debug_marker;
@@ -1087,11 +1087,11 @@ fn record_command_buffer(
                 );
             }
 
-            let pc = PushConstants {
+            let mut pc = PushConstants {
                 model: mesh.world_matrix,
-                material_index: mesh.material_index as u32,
-                _pad: [0; 3],
+                tail: glam::Vec4::ZERO,
             };
+            pc.set_material_index(mesh.material_index as u32);
             let pc_bytes = bytemuck::bytes_of(&pc);
 
             { let dm = debug_marker;
@@ -1345,10 +1345,11 @@ unsafe fn record_blur_passes(
                 &sets,
                 &[],
             );
-            let pc = crate::vulkan::postprocess::BlurPushConstants {
-                texel_size: [1.0 / mip_w as f32, 1.0 / mip_h as f32],
-                direction: 0,
+            let mut pc = crate::vulkan::postprocess::BlurPushConstants {
+                params: glam::Vec4::ZERO,
             };
+            pc.set_texel_size(1.0 / mip_w as f32, 1.0 / mip_h as f32);
+            pc.set_direction(0);
             let pc_bytes = bytemuck::bytes_of(&pc);
             device.cmd_push_constants(
                 command_buffer,
@@ -1394,10 +1395,11 @@ unsafe fn record_blur_passes(
                 &sets2,
                 &[],
             );
-            let pc2 = crate::vulkan::postprocess::BlurPushConstants {
-                texel_size: [1.0 / mip_w as f32, 1.0 / mip_h as f32],
-                direction: 1,
+            let mut pc2 = crate::vulkan::postprocess::BlurPushConstants {
+                params: glam::Vec4::ZERO,
             };
+            pc2.set_texel_size(1.0 / mip_w as f32, 1.0 / mip_h as f32);
+            pc2.set_direction(1);
             let pc_bytes2 = bytemuck::bytes_of(&pc2);
             device.cmd_push_constants(
                 command_buffer,
