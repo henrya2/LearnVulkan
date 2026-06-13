@@ -3,9 +3,8 @@
 layout(set = 0, binding = 0) uniform GlobalUBO {
     mat4 view;
     mat4 proj;
-    vec3 cameraPos;
-    float _pad0;            // std140: align next vec3 to 16
-    vec3 lightDir;
+    vec4 cameraPos;
+    vec4 lightDir;
     float lightIntensity;
     float prefilterMaxLod;
 } globals;
@@ -107,7 +106,7 @@ void main() {
     float occlusion = mix(1.0, aoSample, clamp(mat.occlusionStrength, 0.0, 1.0));
     vec3 emissive = texture(uEmissive, vUV).rgb * mat.emissiveFactor.rgb;
 
-    vec3 V = normalize(globals.cameraPos - vWorldPos);
+    vec3 V = normalize(globals.cameraPos.xyz - vWorldPos);
     vec3 L = normalize(-globals.lightDir);
     vec3 H = normalize(V + L);
 

@@ -149,9 +149,11 @@ impl Renderer {
         );
 
         let ubo_size = std::mem::size_of::<GlobalUniforms>() as vk::DeviceSize;
-        // The UBO must be at least GLOBAL_UBO_BLOCK_SIZE bytes (the std140
-        // block size after the GPU rounds the struct up to a multiple of 16)
-        // so reads of the trailing fields don't fault.
+        // The UBO must be at least GLOBAL_UBO_BLOCK_SIZE bytes. With the
+        // `Vec4`-based struct, `size_of::<GlobalUniforms>()` is already
+        // 176 (a multiple of 16), so the std140 block size equals the
+        // struct size and `max` is a defensive guard in case a future
+        // field layout changes that.
         let alloc_size = GLOBAL_UBO_BLOCK_SIZE.max(ubo_size);
         let mut global_uniforms = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
         let mut global_mapped = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
@@ -648,13 +650,13 @@ impl Renderer {
         let light_dir = glam::Vec3::new(-0.5, -1.0, 0.5).normalize();
         let prefilter_max_lod = (self.ibl.prefilter_map.mip_levels.saturating_sub(1)) as f32;
         let globals = GlobalUniforms {
-            view: view.to_cols_array(),
-            proj: proj.to_cols_array(),
-            camera_pos: [camera_pos.x, camera_pos.y, camera_pos.z],
-            __pad0: 0.0,
-            light_dir: [light_dir.x, light_dir.y, light_dir.z],
+            view: view,
+            proj: proj,
+            camera_pos: glam::Vec4::new(camera_pos.x, camera_pos.y, camera_pos.z, 1.0),
+            light_dir: glam::Vec4::new(light_dir.x, light_dir.y, light_dir.z, 0.0),
             light_intensity: 4.0,
             prefilter_max_lod,
+            _pad_tail: [0.0, 0.0],
         };
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -1086,8 +1088,9 @@ fn record_command_buffer(
             }
 
             let pc = PushConstants {
-                model: mesh.world_matrix.to_cols_array(),
+                model: mesh.world_matrix,
                 material_index: mesh.material_index as u32,
+                _pad: [0; 3],
             };
             let pc_bytes = bytemuck::bytes_of(&pc);
 
