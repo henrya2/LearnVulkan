@@ -16,7 +16,7 @@ use crate::vulkan::postprocess::pyramid::{BLOOM_FORMAT, BLOOM_MIP_COUNT, BloomPy
 use crate::vulkan::postprocess::ubo::PostProcessUBO;
 
 /// High-level tonemap operator selection. Mirrors the GLSL `uint tonemap_op`.
-/// Kept as a type-safe public API for future external callers.
+/// Kept as a type-safe public API for runtime switching.
 #[allow(dead_code)]
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24,6 +24,40 @@ pub enum TonemapOp {
     Linear = 0,
     Reinhard = 1,
     Aces = 2,
+}
+
+impl TonemapOp {
+    /// Cycle to the next operator in the canonical order
+    /// Linear -> Reinhard -> ACES -> Linear. The numeric value of each
+    /// variant is what gets written to `PostProcessUBO::tonemap_op` and read
+    /// by the composite shader's `if/else` chain.
+    pub fn next(self) -> Self {
+        match self {
+            TonemapOp::Linear => TonemapOp::Reinhard,
+            TonemapOp::Reinhard => TonemapOp::Aces,
+            TonemapOp::Aces => TonemapOp::Linear,
+        }
+    }
+
+    /// Numeric value of the operator, as the GLSL `uint` expects.
+    pub fn as_u32(self) -> u32 {
+        self as u32
+    }
+}
+
+impl std::fmt::Display for TonemapOp {
+    /// User-facing label used in the window title. The shader-side label
+    /// stays in the GLSL source (where the `if/else` chain picks the
+    /// operator); this is the spelling shown in the OS window title bar.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            TonemapOp::Linear => "Linear",
+            TonemapOp::Reinhard => "Reinhard",
+            // Capitalised to match the conventional spelling (ACES, not Aces).
+            TonemapOp::Aces => "ACES",
+        };
+        f.write_str(s)
+    }
 }
 
 /// Runtime-tweakable postprocess settings.

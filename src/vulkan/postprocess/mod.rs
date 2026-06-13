@@ -8,5 +8,5 @@ pub mod ubo;
 
 // Public API used by renderer.rs
 pub use pyramid::BloomPyramid;
-pub use resources::PostProcessResources;
+pub use resources::{PostProcessResources, TonemapOp};
 pub use ubo::BlurPushConstants;

@@ -16,7 +16,7 @@ use crate::vulkan::pipeline::{
     PipelineData, create_pbr_pipeline, create_skybox_pipeline,
 };
 use crate::vulkan::postprocess::{
-    BloomPyramid, PostProcessResources,
+    BloomPyramid, PostProcessResources, TonemapOp,
     pass_trait::set_viewport_and_bind_pipeline,
     passes::create_composite_render_pass,
 };
@@ -63,6 +63,11 @@ pub struct Renderer {
     pub skybox_index_count: u32,
     /// Postprocess chain (scene color, bloom, composite).
     pub postprocess: Option<PostProcessResources>,
+    /// Current tonemap operator. Tracked here (not only in the UBO) so it
+    /// survives swapchain recreation, which rebuilds `PostProcessResources`
+    /// with a default tonemap and would otherwise silently reset the user's
+    /// selection.
+    pub current_tonemap: TonemapOp,
     /// Composite render pass (color-only, PRESENT_SRC_KHR). Owned here so we
     /// can recreate the swapchain (and pass it to `create_swapchain`).
     pub composite_render_pass: vk::RenderPass,
@@ -410,11 +415,32 @@ impl Renderer {
             skybox_index_buffer,
             skybox_index_count,
             postprocess: Some(postprocess),
+            current_tonemap: TonemapOp::Aces, // matches PostProcessSettings::default
             composite_render_pass,
         };
 
         renderer.name_debug_objects(ctx);
         renderer
+    }
+
+    /// Set the active tonemap operator. Writes the numeric value to the
+    /// postprocess UBO settings; the next `draw_frame` call will memcpy the
+    /// UBO to the GPU. Safe to call any time — the UBO is `HOST_VISIBLE |
+    /// HOST_COHERENT` and is rewritten every frame.
+    ///
+    /// The state is also stored in `self.current_tonemap` so it survives
+    /// swapchain recreation (which rebuilds `PostProcessResources` with
+    /// `PostProcessSettings::default()` and would otherwise reset the
+    /// selection).
+    ///
+    /// If postprocess resources have not been initialized yet (impossible
+    /// under the current `App` flow but kept defensive), only the
+    /// `current_tonemap` field is updated.
+    pub fn set_tonemap(&mut self, op: TonemapOp) {
+        self.current_tonemap = op;
+        if let Some(pp) = self.postprocess.as_mut() {
+            pp.settings.ubo.tonemap_op = op.as_u32();
+        }
     }
 
     fn name_debug_objects(&self, ctx: &VulkanContext) {
@@ -775,6 +801,14 @@ impl Renderer {
         ));
 
         self.swapchain = swapchain;
+
+        // Re-apply the user's selected tonemap. The freshly constructed
+        // `PostProcessResources` has `TonemapOp::Aces` (the default) — we
+        // must overwrite that with the value the user picked so a window
+        // resize doesn't silently switch them back to ACES.
+        if let Some(pp) = self.postprocess.as_mut() {
+            pp.settings.ubo.tonemap_op = self.current_tonemap.as_u32();
+        }
 
         { let dm = &ctx.debug_marker;
             unsafe {

@@ -10,6 +10,7 @@ use winit::window::{CursorGrabMode, Window};
 use crate::camera::Camera;
 use crate::input::InputState;
 use crate::vulkan::context::VulkanContext;
+use crate::vulkan::postprocess::TonemapOp;
 use crate::vulkan::renderer::Renderer;
 
 pub struct App {
@@ -20,6 +21,10 @@ pub struct App {
     pub input: InputState,
     pub mouse_locked: bool,
     pub last_frame: Instant,
+    /// Current tonemap selection. Kept in sync with the renderer's UBO via
+    /// `cycle_tonemap`; on startup it is initialized to match the renderer's
+    /// default (ACES, per `PostProcessSettings::default`).
+    pub current_tonemap: TonemapOp,
 }
 
 impl Drop for App {
@@ -43,6 +48,15 @@ impl App {
         let size = window.inner_size();
         let renderer = Renderer::new(&ctx, size.width, size.height);
 
+        let current_tonemap = TonemapOp::Aces;
+        // Set the initial window title from the tonemap we just initialised
+        // the renderer with. The constructor in `main.rs` only knows a
+        // static string; the actual tonemap defaults live in
+        // `PostProcessSettings::default`, so the title must be applied
+        // here (after both are constructed) to stay in sync.
+        let title = format_title(current_tonemap);
+        window.set_title(&title);
+
         Self {
             window,
             ctx: ManuallyDrop::new(ctx),
@@ -51,6 +65,7 @@ impl App {
             input: InputState::new(),
             mouse_locked: false,
             last_frame: Instant::now(),
+            current_tonemap,
         }
     }
 
@@ -84,8 +99,27 @@ impl App {
                     self.set_mouse_lock(false);
                 }
             }
+            PhysicalKey::Code(KeyCode::KeyT) => {
+                if pressed {
+                    self.cycle_tonemap();
+                }
+            }
             _ => {}
         }
+    }
+
+    /// Advance the tonemap selection Linear -> Reinhard -> ACES -> Linear and
+    /// push the new value to the renderer. The UBO is rewritten every frame,
+    /// so the change takes effect on the very next `draw_frame`. The window
+    /// title is updated to match so the user can see which operator is
+    /// active from the taskbar / window list.
+    pub fn cycle_tonemap(&mut self) {
+        let next = self.current_tonemap.next();
+        self.current_tonemap = next;
+        self.renderer.set_tonemap(next);
+        let title = format_title(next);
+        self.window.set_title(&title);
+        eprintln!("[tonemap] -> {}", next);
     }
 
     pub fn on_mouse_button(&mut self, button: MouseButton, state: ElementState) {
@@ -169,4 +203,11 @@ impl App {
             self.camera.position,
         )
     }
+}
+
+/// Build the user-facing window title. Format: "LearnVulkan - Tonemap: <OP>".
+/// Used both at startup and on every tonemap switch (T key). Kept as a free
+/// function so the format is defined in exactly one place.
+fn format_title(op: TonemapOp) -> String {
+    format!("LearnVulkan - Tonemap: {}", op)
 }

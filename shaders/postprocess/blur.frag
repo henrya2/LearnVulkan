@@ -10,7 +10,7 @@ layout(set = 1, binding = 0) uniform PostProcessUBO {
     float bloom_threshold;
     float bloom_knee;
     float bloom_intensity;
-    float bloom_weights[8];
+    vec4 bloom_weights[2];
     uint  tonemap_op;
 } pp;
 

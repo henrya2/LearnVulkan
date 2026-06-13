@@ -22,8 +22,12 @@ struct AppHandler {
 impl ApplicationHandler for AppHandler {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.app.is_none() {
+            // The title is set twice: once here as a placeholder (visible
+            // for the first frame at most, before `App::new` runs) and
+            // again by `App::new` from the actual current `TonemapOp`.
+            // The final, correct title is the one set in `App::new`.
             let attrs = Window::default_attributes()
-                .with_title("LearnVulkan - FPS Camera")
+                .with_title("LearnVulkan - Tonemap: ACES")
                 .with_inner_size(winit::dpi::LogicalSize::new(self.width, self.height));
             let window = event_loop.create_window(attrs).unwrap();
             self.app = Some(App::new(window, self.enable_validation));

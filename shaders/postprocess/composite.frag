@@ -22,24 +22,85 @@ layout(set = 1, binding = 0) uniform PostProcessUBO {
     float bloom_threshold;
     float bloom_knee;
     float bloom_intensity;
-    float bloom_weights[8];
+    vec4 bloom_weights[2];
     uint  tonemap_op;
 } pp;
 
 layout(location = 0) in vec2 vUV;
 layout(location = 0) out vec4 outColor;
 
-vec3 aces(vec3 c) {
-    const float a = 2.51;
-    const float b = 0.03;
-    const float c2 = 2.43;
-    const float d = 0.59;
-    const float e = 0.14;
-    return clamp((c * (a * c + b)) / (c * (c2 * c + d) + e), 0.0, 1.0);
+// ACES filmic tonemapping — Stephen Hill's RRT+ODT fit (2017).
+//
+// This is the de-facto standard replacement for the Narkowicz simplified
+// curve: it is a least-squares fit of the full RRT (Reference Rendering
+// Transform) + ODT (Output Device Transform) pipeline baked into a single
+// per-channel formula, with a pre-multiply input matrix that converts the
+// working color space to AP1 (ACES RRT space) and a post-multiply output
+// matrix that converts back to display sRGB. Source:
+//   https://github.com/TheRealMJP/BakingLab/blob/master/BakingLab/ACES.hlsl
+//
+// Input is linear sRGB primaries (post-exposure) in [0, +inf).
+// Output is linear sRGB primaries clamped to [0, 1]. The Vulkan swapchain
+// then performs the final linear->sRGB encoding on store.
+//
+// **IMPORTANT – GLSL column-major:**
+// The HLSL reference declares `float3x3` rows; GLSL `mat3` is always
+// column-major.  Each `vec3(…)` passed to the `mat3` constructor becomes a
+// **column**.  To port HLSL row-major data verbatim the values must be
+// **transposed**: `mat3(col0, col1, col2)` where
+//   col_j[i] = HLSL_row_i[j].
+// Using the untransposed HLSL rows as GLSL columns would silently produce
+// the matrix transpose, which causes a strong magenta/purple colour cast
+// in any bright area with non-zero green and blue because the output
+// matrix's negative coefficients land in the wrong slots.
+
+// sRGB => XYZ => D65_2_D60 => AP1 => RRT_SAT
+const mat3 ACESInputMat = mat3(
+    vec3(0.59719, 0.07600, 0.02840),  // col 0 — ported HLSL row 0
+    vec3(0.35458, 0.90834, 0.13383),  // col 1 — ported HLSL row 1
+    vec3(0.04823, 0.01566, 0.83777)   // col 2 — ported HLSL row 2
+);
+
+// ODT_SAT => XYZ => D60_2_D65 => sRGB
+const mat3 ACESOutputMat = mat3(
+    vec3( 1.60475, -0.10208, -0.00327),  // col 0 — ported HLSL row 0
+    vec3(-0.53108,  1.10813, -0.07276),  // col 1 — ported HLSL row 1
+    vec3(-0.07367, -0.00605,  1.07602)   // col 2 — ported HLSL row 2
+);
+
+vec3 acesRRTAndODTFit(vec3 v) {
+    vec3 a = v * (v + 0.0245786) - 0.000090537;
+    vec3 b = v * (0.983729 * v + 0.4329510) + 0.238081;
+    return a / b;
 }
 
-vec3 reinhard(vec3 c) {
-    return c / (c + vec3(1.0));
+vec3 aces(vec3 c) {
+    c = ACESInputMat * c;
+    c = acesRRTAndODTFit(c);
+    c = ACESOutputMat * c;
+    return clamp(c, 0.0, 1.0);
+}
+
+// Reinhard-Jodie (2015, joint Reinhard with per-channel whitepoint).
+// Reference: https://www.shadertoy.com/view/MdlXrX
+//   L_white = 4.0  (linear scene-linear luminance that maps to 1.0 in the
+//                    display; can be tuned for taste, 4.0 is the author's
+//                    default that preserves "sun-like" highlights)
+//
+// The key fix over the textbook Reinhard x/(1+x) is that compression is
+// applied to the luminance L, not to each channel independently, while the
+// per-channel ratio color / L is preserved. This stops bright colors from
+// desaturating to white — the most common "Reinhard looks washed out" issue.
+const float L_WHITE = 4.0;
+
+vec3 reinhardJodie(vec3 c) {
+    float L = dot(c, vec3(0.2126, 0.7152, 0.0722)); // Rec.709 luminance
+    float Lt = L / (1.0 + L);
+    // Per-channel whitepoint correction: each channel tints towards
+    // (channel / L) * L_white / (1 + L_white) at the brightest end.
+    vec3 cTint = (L > 0.0) ? (c / L) * Lt : vec3(0.0);
+    vec3 cWhite = (L > 0.0) ? (c / L) * (L_WHITE / (1.0 + L_WHITE)) : vec3(0.0);
+    return mix(cTint, cWhite, Lt * Lt);
 }
 
 void main() {
@@ -49,26 +110,28 @@ void main() {
     vec3 scene = texture(uSceneColor, uv).rgb;
 
     vec3 bloom = vec3(0.0);
-    bloom += texture(uBloom0, uv).rgb * pp.bloom_weights[0];
-    bloom += texture(uBloom1, uv).rgb * pp.bloom_weights[1];
-    bloom += texture(uBloom2, uv).rgb * pp.bloom_weights[2];
-    bloom += texture(uBloom3, uv).rgb * pp.bloom_weights[3];
-    bloom += texture(uBloom4, uv).rgb * pp.bloom_weights[4];
-    bloom += texture(uBloom5, uv).rgb * pp.bloom_weights[5];
-    bloom += texture(uBloom6, uv).rgb * pp.bloom_weights[6];
-    bloom += texture(uBloom7, uv).rgb * pp.bloom_weights[7];
+    bloom += texture(uBloom0, uv).rgb * pp.bloom_weights[0].r;
+    bloom += texture(uBloom1, uv).rgb * pp.bloom_weights[0].g;
+    bloom += texture(uBloom2, uv).rgb * pp.bloom_weights[0].b;
+    bloom += texture(uBloom3, uv).rgb * pp.bloom_weights[0].a;
+    bloom += texture(uBloom4, uv).rgb * pp.bloom_weights[1].r;
+    bloom += texture(uBloom5, uv).rgb * pp.bloom_weights[1].g;
+    bloom += texture(uBloom6, uv).rgb * pp.bloom_weights[1].b;
+    bloom += texture(uBloom7, uv).rgb * pp.bloom_weights[1].a;
     bloom *= pp.bloom_intensity;
 
     vec3 color = scene + bloom;
+    // Exposure: positive stops brighten, negative stops darken.
     color *= pow(2.0, pp.exposure);
 
     vec3 mapped;
     if (pp.tonemap_op == 1u) {
-        mapped = reinhard(color);
+        mapped = reinhardJodie(color);
     } else if (pp.tonemap_op == 2u) {
         mapped = aces(color);
     } else {
-        // 0 = linear / none (useful for debug)
+        // 0 = linear / none. Useful for debug: shows raw HDR (clipped to LDR).
+        // No gamma / no sRGB curve here — Vulkan encodes linear->sRGB on store.
         mapped = clamp(color, 0.0, 1.0);
     }
 
