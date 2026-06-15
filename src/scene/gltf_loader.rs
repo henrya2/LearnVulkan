@@ -5,15 +5,16 @@ use std::collections::{HashMap, HashSet};
 use crate::mesh::PbrVertex;
 use crate::scene::model::GpuMesh;
 use crate::scene::{GpuMaterial, PbrMaterial, SceneGraph, SceneNode};
-use crate::vulkan::buffer::{GpuBuffer, create_device_local_buffer};
+use crate::vulkan::buffer::create_device_local_buffer;
 use crate::vulkan::context::VulkanContext;
+use crate::vulkan::memory::OwnedBuffer;
 use crate::vulkan::texture::Texture;
 
 pub struct Scene {
     pub meshes: Vec<GpuMesh>,
     pub materials: Vec<PbrMaterial>,
     pub textures: Vec<Texture>,
-    pub material_buffer: GpuBuffer,
+    pub material_buffer: OwnedBuffer,
     pub fallback_textures: FallbackTextures,
 }
 
@@ -31,7 +32,7 @@ struct DecodedImage {
     height: u32,
 }
 
-pub fn load_gltf(ctx: &VulkanContext, command_pool: vk::CommandPool, path: &str) -> Scene {
+pub fn load_gltf(ctx: &mut VulkanContext, command_pool: vk::CommandPool, path: &str) -> Scene {
     let (document, buffers, images) =
         gltf::import(path).unwrap_or_else(|e| panic!("Failed to load glTF {}: {}", path, e));
 
@@ -212,12 +213,14 @@ pub fn load_gltf(ctx: &VulkanContext, command_pool: vk::CommandPool, path: &str)
                 let vb = create_device_local_buffer(
                     ctx,
                     command_pool,
+                    "Mesh Vertex Buffer",
                     &vertices,
                     vk::BufferUsageFlags::VERTEX_BUFFER,
                 );
                 let ib = create_device_local_buffer(
                     ctx,
                     command_pool,
+                    "Mesh Index Buffer",
                     &indices,
                     vk::BufferUsageFlags::INDEX_BUFFER,
                 );
@@ -259,6 +262,7 @@ pub fn load_gltf(ctx: &VulkanContext, command_pool: vk::CommandPool, path: &str)
     let material_buffer = create_device_local_buffer(
         ctx,
         command_pool,
+        "Material Uniform Buffer",
         &gpu_materials,
         vk::BufferUsageFlags::UNIFORM_BUFFER,
     );
@@ -297,7 +301,7 @@ fn decode_image(image: &gltf::image::Data) -> DecodedImage {
 }
 
 fn get_or_create_texture_variant(
-    ctx: &VulkanContext,
+    ctx: &mut VulkanContext,
     command_pool: vk::CommandPool,
     decoded_images: &[DecodedImage],
     textures: &mut Vec<Texture>,
@@ -358,7 +362,7 @@ fn add_reachable_children(
 }
 
 fn create_fallback_textures(
-    ctx: &VulkanContext,
+    ctx: &mut VulkanContext,
     command_pool: vk::CommandPool,
 ) -> FallbackTextures {
     let white_srgb = Texture::from_rgba8_with_format(
@@ -456,28 +460,29 @@ fn compute_tangents(positions: &[[f32; 3]], normals: &[[f32; 3]]) -> Vec<[f32; 4
 }
 
 impl Scene {
-    pub unsafe fn destroy(&mut self, device: &ash::Device) {
+    pub unsafe fn destroy(
+        &mut self,
+        device: &ash::Device,
+        allocator: &mut crate::vulkan::memory::MemoryAllocator,
+    ) {
         for mesh in &self.meshes {
             unsafe {
-                mesh.destroy(device);
+                mesh.destroy(device, allocator);
             }
         }
-        unsafe {
-            self.material_buffer.destroy(device);
-        }
-        for tex in &self.textures {
+        self.material_buffer.destroy(device, allocator);
+        for tex in &mut self.textures {
             unsafe {
-                tex.destroy(device);
+                tex.destroy(device, allocator);
             }
         }
         unsafe {
-            self.fallback_textures.white_srgb.destroy(device);
-            self.fallback_textures.white_linear.destroy(device);
-            self.fallback_textures.black_srgb.destroy(device);
-            self.fallback_textures.normal_linear.destroy(device);
+            self.fallback_textures.white_srgb.destroy(device, allocator);            self.fallback_textures.white_linear.destroy(device, allocator);
+            self.fallback_textures.black_srgb.destroy(device, allocator);
+            self.fallback_textures.normal_linear.destroy(device, allocator);
             self.fallback_textures
                 .metallic_roughness_linear
-                .destroy(device);
+                .destroy(device, allocator);
         }
     }
 }

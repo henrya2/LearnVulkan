@@ -30,7 +30,24 @@ pub struct App {
 impl Drop for App {
     fn drop(&mut self) {
         unsafe {
+            // 1. Explicitly destroy all renderer resources (requires allocator).
+            //    This calls every `destroy(device, allocator)` on the renderer's
+            //    owned resources, freeing all `Allocation`s through the allocator
+            //    and destroying all Vulkan objects.
+            //
+            //    Use raw pointers to bypass the borrow checker: the lifetimes
+            //    are clear (`renderer` is used before `ctx` is dropped), and
+            //    `destroy` does not retain the borrows past its return.
+            let renderer_ptr: *mut Renderer = &mut *self.renderer as *mut Renderer;
+            let device_ptr: *const ash::Device = &self.ctx.device as *const ash::Device;
+            let allocator_ptr: *mut crate::vulkan::memory::MemoryAllocator =
+                &mut *self.ctx.allocator as *mut _;
+            (*renderer_ptr).destroy(&*device_ptr, &mut *allocator_ptr);
+            // 2. Drop the Renderer struct. Renderer's Drop is empty (debug-only
+            //    warn if destroy wasn't called).
             ManuallyDrop::drop(&mut self.renderer);
+            // 3. Drop VulkanContext. Its Drop manually drops the allocator
+            //    before destroying the device.
             ManuallyDrop::drop(&mut self.ctx);
         }
     }
@@ -47,10 +64,12 @@ impl App {
         let display = window.display_handle().unwrap();
         let win_handle = window.window_handle().unwrap();
 
-        let ctx = VulkanContext::new(display, win_handle, enable_validation, enable_gpu_assisted);
+        let mut ctx = VulkanContext::new(display, win_handle, enable_validation, enable_gpu_assisted);
 
         let size = window.inner_size();
-        let renderer = Renderer::new(&ctx, size.width, size.height);
+        // Renderer::new needs `&mut ctx` because it allocates buffers/images
+        // via the allocator during construction.
+        let renderer = Renderer::new(&mut ctx, size.width, size.height);
 
         let current_tonemap = TonemapOp::Aces;
         // Set the initial window title from the tonemap we just initialised
@@ -81,7 +100,9 @@ impl App {
 
     pub fn draw_frame(&mut self) {
         let (view, proj, camera_pos) = self.update();
-        self.renderer.draw_frame(&self.ctx, view, proj, camera_pos);
+        // draw_frame needs `&mut ctx` because it can trigger a swapchain
+        // recreate, which uses the allocator.
+        self.renderer.draw_frame(&mut self.ctx, view, proj, camera_pos);
     }
 
     pub fn window(&self) -> &Window {

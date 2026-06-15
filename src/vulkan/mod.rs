@@ -6,6 +6,7 @@ pub mod debug_marker;
 pub mod descriptors;
 pub mod ibl;
 pub mod ktx2_loader;
+pub mod memory;
 pub mod pbr_ubo;
 pub mod pipeline;
 pub mod postprocess;

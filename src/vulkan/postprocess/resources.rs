@@ -1,10 +1,11 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use ash::vk;
+use gpu_allocator::MemoryLocation;
 
-use crate::vulkan::buffer::create_buffer;
 use crate::vulkan::context::VulkanContext;
 use crate::vulkan::debug_marker::DebugMarker;
+use crate::vulkan::memory::{MemoryAllocator, OwnedBuffer};
 use crate::vulkan::postprocess::descriptors::{
     create_composite_input_layout, create_postprocess_ubo_layout, create_single_input_layout,
 };
@@ -95,7 +96,7 @@ pub struct PostProcessResources {
     // Scene color (per swapchain image)
     pub scene_format: vk::Format,
     pub scene_images: Vec<vk::Image>,
-    pub scene_memories: Vec<vk::DeviceMemory>,
+    pub scene_allocations: Vec<gpu_allocator::vulkan::Allocation>,
     pub scene_views: Vec<vk::ImageView>,
     pub scene_framebuffers: Vec<vk::Framebuffer>,
 
@@ -127,7 +128,7 @@ pub struct PostProcessResources {
 
     // Descriptor pool + sets
     pub descriptor_pool: vk::DescriptorPool,
-    pub ubo: Vec<crate::vulkan::buffer::GpuBuffer>,
+    pub ubo: Vec<OwnedBuffer>,
     pub ubo_mapped: Vec<*mut u8>,
     pub ubo_sets: Vec<vk::DescriptorSet>,            // per-frame-in-flight
     pub bright_input_sets: Vec<vk::DescriptorSet>,   // per swapchain image
@@ -146,7 +147,7 @@ impl PostProcessResources {
     /// shared between the swapchain framebuffers and the composite pipeline.
     /// `PostProcessResources` does not destroy it.
     pub fn new(
-        ctx: &VulkanContext,
+        ctx: &mut VulkanContext,
         command_pool: vk::CommandPool,
         depth_format: vk::Format,
         swapchain_format: vk::Format,
@@ -157,18 +158,18 @@ impl PostProcessResources {
         composite_render_pass: vk::RenderPass,
     ) -> Self {
         let _ = swapchain_format;
-        let device = &ctx.device;
         let num_swapchain_images = swapchain_image_views.len();
 
         // --- Render passes ---
-        let scene_render_pass = create_scene_render_pass(device, BLOOM_FORMAT, depth_format);
-        let postprocess_color_pass = create_postprocess_color_pass(device, BLOOM_FORMAT);
+        let scene_render_pass = create_scene_render_pass(&ctx.device, BLOOM_FORMAT, depth_format);
+        let postprocess_color_pass =
+            create_postprocess_color_pass(&ctx.device, BLOOM_FORMAT);
 
-        // --- Scene color images / views / memories ---
+        // --- Scene color images / views / allocations ---
         let mut scene_images = Vec::with_capacity(num_swapchain_images);
-        let mut scene_memories = Vec::with_capacity(num_swapchain_images);
+        let mut scene_allocations = Vec::with_capacity(num_swapchain_images);
         let mut scene_views = Vec::with_capacity(num_swapchain_images);
-        for _ in 0..num_swapchain_images {
+        for i in 0..num_swapchain_images {
             let extent = vk::Extent3D {
                 width: swapchain_extent.width,
                 height: swapchain_extent.height,
@@ -190,22 +191,15 @@ impl PostProcessResources {
                 )
                 .samples(vk::SampleCountFlags::TYPE_1)
                 .sharing_mode(vk::SharingMode::EXCLUSIVE);
-            let image = unsafe { device.create_image(&image_info, None).unwrap() };
-            let mem_reqs = unsafe { device.get_image_memory_requirements(image) };
-            let mem_type = crate::vulkan::buffer::find_memory_type(
-                &ctx.instance,
-                ctx.physical_device,
-                mem_reqs.memory_type_bits,
-                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            let owned = ctx.allocator.create_image(
+                &ctx.device,
+                &format!("SceneColor_{i}"),
+                &image_info,
+                MemoryLocation::GpuOnly,
             );
-            let alloc_info = vk::MemoryAllocateInfo::default()
-                .allocation_size(mem_reqs.size)
-                .memory_type_index(mem_type);
-            let memory = unsafe { device.allocate_memory(&alloc_info, None).unwrap() };
-            unsafe { device.bind_image_memory(image, memory, 0).unwrap() };
 
             let view_info = vk::ImageViewCreateInfo::default()
-                .image(image)
+                .image(owned.image)
                 .view_type(vk::ImageViewType::TYPE_2D)
                 .format(BLOOM_FORMAT)
                 .subresource_range(vk::ImageSubresourceRange {
@@ -215,10 +209,10 @@ impl PostProcessResources {
                     base_array_layer: 0,
                     layer_count: 1,
                 });
-            let view = unsafe { device.create_image_view(&view_info, None).unwrap() };
+            let view = unsafe { ctx.device.create_image_view(&view_info, None).unwrap() };
 
-            scene_images.push(image);
-            scene_memories.push(memory);
+            scene_allocations.push(owned.allocation.expect("scene color: allocation missing"));
+            scene_images.push(owned.image);
             scene_views.push(view);
         }
 
@@ -232,7 +226,7 @@ impl PostProcessResources {
                 .width(swapchain_extent.width)
                 .height(swapchain_extent.height)
                 .layers(1);
-            let fb = unsafe { device.create_framebuffer(&info, None).unwrap() };
+            let fb = unsafe { ctx.device.create_framebuffer(&info, None).unwrap() };
             scene_framebuffers.push(fb);
         }
 
@@ -284,7 +278,7 @@ impl PostProcessResources {
                 .dst_access_mask(vk::AccessFlags::SHADER_READ),
         ];
         crate::vulkan::buffer::with_one_time_command(ctx, command_pool, |cmd| unsafe {
-            device.cmd_pipeline_barrier(
+            ctx.device.cmd_pipeline_barrier(
                 cmd,
                 vk::PipelineStageFlags::TOP_OF_PIPE,
                 vk::PipelineStageFlags::FRAGMENT_SHADER,
@@ -310,7 +304,7 @@ impl PostProcessResources {
                 .width(mip0_w)
                 .height(mip0_h)
                 .layers(1);
-            unsafe { device.create_framebuffer(&info, None).unwrap() }
+            unsafe { ctx.device.create_framebuffer(&info, None).unwrap() }
         };
         let mut blur_temp_framebuffers = Vec::with_capacity(BLOOM_MIP_COUNT);
         let mut blur_mip_framebuffers = Vec::with_capacity(BLOOM_MIP_COUNT);
@@ -323,7 +317,7 @@ impl PostProcessResources {
                 .width(w)
                 .height(h)
                 .layers(1);
-            let temp_fb = unsafe { device.create_framebuffer(&temp_info, None).unwrap() };
+            let temp_fb = unsafe { ctx.device.create_framebuffer(&temp_info, None).unwrap() };
             blur_temp_framebuffers.push(temp_fb);
 
             let mip_attachments = [bloom.as_ref().unwrap().mip_views[level]];
@@ -333,14 +327,14 @@ impl PostProcessResources {
                 .width(w)
                 .height(h)
                 .layers(1);
-            let mip_fb = unsafe { device.create_framebuffer(&mip_info, None).unwrap() };
+            let mip_fb = unsafe { ctx.device.create_framebuffer(&mip_info, None).unwrap() };
             blur_mip_framebuffers.push(mip_fb);
         }
 
         // --- Descriptor layouts ---
-        let ubo_layout = create_postprocess_ubo_layout(device);
-        let single_input_layout = create_single_input_layout(device);
-        let composite_input_layout = create_composite_input_layout(device);
+        let ubo_layout = create_postprocess_ubo_layout(&ctx.device);
+        let single_input_layout = create_single_input_layout(&ctx.device);
+        let composite_input_layout = create_composite_input_layout(&ctx.device);
 
         // --- Pipeline layouts ---
         // Postprocess shaders declare bindings at `set = 0` (input samplers)
@@ -349,7 +343,7 @@ impl PostProcessResources {
         // Bright: set 0 = scene sampler, set 1 = UBO
         let bright_set_layouts = [single_input_layout, ubo_layout];
         let bright_pipeline_layout = unsafe {
-            device
+            ctx.device
                 .create_pipeline_layout(
                     &vk::PipelineLayoutCreateInfo::default().set_layouts(&bright_set_layouts),
                     None,
@@ -363,7 +357,7 @@ impl PostProcessResources {
             .offset(0)
             .size(std::mem::size_of::<crate::vulkan::postprocess::ubo::BlurPushConstants>() as u32);
         let blur_pipeline_layout = unsafe {
-            device
+            ctx.device
                 .create_pipeline_layout(
                     &vk::PipelineLayoutCreateInfo::default()
                         .set_layouts(&blur_set_layouts)
@@ -375,7 +369,7 @@ impl PostProcessResources {
         // Composite: set 0 = 9 samplers, set 1 = UBO
         let composite_set_layouts = [composite_input_layout, ubo_layout];
         let composite_pipeline_layout = unsafe {
-            device
+            ctx.device
                 .create_pipeline_layout(
                     &vk::PipelineLayoutCreateInfo::default().set_layouts(&composite_set_layouts),
                     None,
@@ -389,19 +383,19 @@ impl PostProcessResources {
         let composite_frag = include_bytes!("../../../shaders/postprocess/composite.frag.spv");
 
         let bright_pipeline = Some(create_fullscreen_pipeline(
-            device,
+            &ctx.device,
             postprocess_color_pass,
             bright_pipeline_layout,
             bright_frag,
         ));
         let blur_pipeline = Some(create_fullscreen_pipeline(
-            device,
+            &ctx.device,
             postprocess_color_pass,
             blur_pipeline_layout,
             blur_frag,
         ));
         let composite_pipeline = Some(create_fullscreen_pipeline(
-            device,
+            &ctx.device,
             composite_render_pass,
             composite_pipeline_layout,
             composite_frag,
@@ -432,27 +426,21 @@ impl PostProcessResources {
         let pool_info = vk::DescriptorPoolCreateInfo::default()
             .pool_sizes(&pool_sizes)
             .max_sets(total_sets);
-        let descriptor_pool = unsafe { device.create_descriptor_pool(&pool_info, None).unwrap() };
+        let descriptor_pool =
+            unsafe { ctx.device.create_descriptor_pool(&pool_info, None).unwrap() };
 
         // --- UBO buffers (one per frame in flight) ---
         let ubo_size = std::mem::size_of::<PostProcessUBO>() as vk::DeviceSize;
         let mut ubo = Vec::with_capacity(max_frames_in_flight);
         let mut ubo_mapped = Vec::with_capacity(max_frames_in_flight);
-        for _ in 0..max_frames_in_flight {
-            let buf = create_buffer(
-                device,
+        for i in 0..max_frames_in_flight {
+            let owned = ctx.allocator.create_host_mapped_ubo(
+                &ctx.device,
+                &format!("PostProcessUBO_Frame{i}"),
                 ubo_size,
-                vk::BufferUsageFlags::UNIFORM_BUFFER,
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-                &ctx.instance,
-                ctx.physical_device,
             );
-            let ptr = unsafe {
-                device
-                    .map_memory(buf.memory, 0, ubo_size, vk::MemoryMapFlags::empty())
-                    .unwrap()
-            } as *mut u8;
-            ubo.push(buf);
+            let ptr = owned.mapped_ptr();
+            ubo.push(owned);
             ubo_mapped.push(ptr);
         }
 
@@ -462,7 +450,7 @@ impl PostProcessResources {
         let ubo_alloc = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(descriptor_pool)
             .set_layouts(&mut ubo_set_layouts);
-        let ubo_sets = unsafe { device.allocate_descriptor_sets(&ubo_alloc).unwrap() };
+        let ubo_sets = unsafe { ctx.device.allocate_descriptor_sets(&ubo_alloc).unwrap() };
         for (i, &set) in ubo_sets.iter().enumerate() {
             let info = vk::DescriptorBufferInfo::default()
                 .buffer(ubo[i].buffer)
@@ -474,7 +462,7 @@ impl PostProcessResources {
                 .dst_array_element(0)
                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                 .buffer_info(std::slice::from_ref(&info));
-            unsafe { device.update_descriptor_sets(std::slice::from_ref(&write), &[]) };
+            unsafe { ctx.device.update_descriptor_sets(std::slice::from_ref(&write), &[]) };
         }
 
         // Defer per-image set allocation to first frame setup. They need
@@ -486,7 +474,7 @@ impl PostProcessResources {
             composite_render_pass,
             scene_format: BLOOM_FORMAT,
             scene_images,
-            scene_memories,
+            scene_allocations,
             scene_views,
             scene_framebuffers,
             bloom,
@@ -523,11 +511,10 @@ impl PostProcessResources {
     ///
     /// On resize, call `reset_descriptor_pool` first to free old sets, then
     /// re-allocate the UBO sets and call this.
-    fn allocate_input_sets(&mut self, ctx: &VulkanContext) {
+    fn allocate_input_sets(&mut self, ctx: &mut VulkanContext) {
         let device = &ctx.device;
         let bloom = self.bloom.as_ref().expect("bloom must exist");
         let bloom_sampler = bloom.sampler;
-
         // Bright input sets: one per swapchain image, sample scene color.
         let layouts = vec![self.single_input_layout; self.num_swapchain_images];
         let alloc = vk::DescriptorSetAllocateInfo::default()
@@ -653,15 +640,15 @@ impl PostProcessResources {
             );
 
             // Scene color images (per swapchain image)
-            for (i, (&image, (&view, &memory))) in self
+            for (i, (&image, (&view, allocation))) in self
                 .scene_images
                 .iter()
-                .zip(self.scene_views.iter().zip(self.scene_memories.iter()))
+                .zip(self.scene_views.iter().zip(self.scene_allocations.iter()))
                 .enumerate()
             {
                 dm.set_object_name(image, &format!("Scene Color Image {}", i));
                 dm.set_object_name(view, &format!("Scene Color View {}", i));
-                dm.set_object_name(memory, &format!("Scene Color Memory {}", i));
+                dm.set_object_name(allocation.memory(), &format!("Scene Color Memory {}", i));
                 dm.set_object_name(
                     self.scene_framebuffers[i],
                     &format!("Scene Color Framebuffer {}", i),
@@ -724,10 +711,6 @@ impl PostProcessResources {
                     buf.buffer,
                     &format!("Postprocess UBO Buffer Frame {}", i),
                 );
-                dm.set_object_name(
-                    buf.memory,
-                    &format!("Postprocess UBO Memory Frame {}", i),
-                );
             }
 
             // DUBO descriptor sets (per frame in flight)
@@ -753,9 +736,9 @@ impl PostProcessResources {
         }
     }
 
-    /// Destroy all device resources. Call from `Renderer::drop` before the
+    /// Destroy all device resources. Call from `Renderer::destroy` before the
     /// descriptor pool, scene, and pipelines are destroyed.
-    pub unsafe fn destroy(&mut self, device: &ash::Device) {
+    pub unsafe fn destroy(&mut self, device: &ash::Device, allocator: &mut MemoryAllocator) {
         unsafe {
             // Pipelines + layouts
             if let Some(p) = self.bright_pipeline.take() {
@@ -785,10 +768,8 @@ impl PostProcessResources {
             device.destroy_descriptor_set_layout(self.composite_input_layout, None);
 
             // UBOs
-            for (buf, mapped) in self.ubo.drain(..).zip(self.ubo_mapped.drain(..)) {
-                device.unmap_memory(buf.memory);
-                let _ = mapped;
-                buf.destroy(device);
+            for mut buf in self.ubo.drain(..) {
+                buf.destroy(device, allocator);
             }
 
             // Scene color images
@@ -798,8 +779,11 @@ impl PostProcessResources {
             for image in self.scene_images.drain(..) {
                 device.destroy_image(image, None);
             }
-            for mem in self.scene_memories.drain(..) {
-                device.free_memory(mem, None);
+            for alloc in self.scene_allocations.drain(..) {
+                allocator
+                    .inner
+                    .free(alloc)
+                    .expect("Failed to free scene color allocation");
             }
             for fb in self.scene_framebuffers.drain(..) {
                 device.destroy_framebuffer(fb, None);
@@ -818,7 +802,7 @@ impl PostProcessResources {
 
             // Bloom pyramid
             if let Some(mut b) = self.bloom.take() {
-                b.destroy(device);
+                b.destroy(device, allocator);
             }
         }
     }

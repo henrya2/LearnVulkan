@@ -4,6 +4,7 @@ use crate::vulkan::brdf_lut::{BrdfLut, generate_brdf_lut};
 use crate::vulkan::context::VulkanContext;
 use crate::vulkan::cubemap::Cubemap;
 use crate::vulkan::ktx2_loader::load_ktx2_cubemap;
+use crate::vulkan::memory::MemoryAllocator;
 
 pub struct IblResources {
     pub env_cubemap: Cubemap,
@@ -13,21 +14,30 @@ pub struct IblResources {
 }
 
 impl IblResources {
-    pub fn load(ctx: &VulkanContext, command_pool: vk::CommandPool, env_base_path: &str) -> Self {
+    pub fn load(ctx: &mut VulkanContext, command_pool: vk::CommandPool, env_base_path: &str) -> Self {
+        // Env + prefilter are large cubemaps; use dedicated blocks so the
+        // sub-allocator pool is not perturbed. Irradiance is small enough
+        // for managed sub-allocation.
         let env_cubemap = load_ktx2_cubemap(
             ctx,
             command_pool,
             &format!("{}/lambertian/outputCubeMap.ktx2", env_base_path),
+            "EnnisEnvCubemap",
+            true,
         );
         let irradiance_map = load_ktx2_cubemap(
             ctx,
             command_pool,
             &format!("{}/lambertian/diffuse.ktx2", env_base_path),
+            "EnnisIrradianceMap",
+            false,
         );
         let prefilter_map = load_ktx2_cubemap(
             ctx,
             command_pool,
             &format!("{}/ggx/specular.ktx2", env_base_path),
+            "EnnisPrefilterMap",
+            true,
         );
         let brdf_lut = generate_brdf_lut(ctx, command_pool);
 
@@ -39,12 +49,12 @@ impl IblResources {
         }
     }
 
-    pub unsafe fn destroy(&self, device: &ash::Device) {
+    pub unsafe fn destroy(&mut self, device: &ash::Device, allocator: &mut MemoryAllocator) {
         unsafe {
-            self.env_cubemap.destroy(device);
-            self.irradiance_map.destroy(device);
-            self.prefilter_map.destroy(device);
-            self.brdf_lut.destroy(device);
+            self.env_cubemap.destroy(device, allocator);
+            self.irradiance_map.destroy(device, allocator);
+            self.prefilter_map.destroy(device, allocator);
+            self.brdf_lut.destroy(device, allocator);
         }
     }
 }

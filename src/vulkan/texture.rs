@@ -1,12 +1,14 @@
 use ash::vk;
+use gpu_allocator::MemoryLocation;
 use std::path::Path;
 
-use crate::vulkan::buffer::{create_buffer, find_memory_type, with_one_time_command};
+use crate::vulkan::buffer::with_one_time_command;
 use crate::vulkan::context::VulkanContext;
+use crate::vulkan::memory::MemoryAllocator;
 
 pub struct Texture {
     pub image: vk::Image,
-    pub memory: vk::DeviceMemory,
+    pub allocation: Option<gpu_allocator::vulkan::Allocation>,
     pub view: vk::ImageView,
     pub sampler: vk::Sampler,
 }
@@ -14,7 +16,7 @@ pub struct Texture {
 impl Texture {
     /// Load a PNG file, decode to RGBA8, and upload to a device-local image.
     pub fn from_png<P: AsRef<Path>>(
-        ctx: &VulkanContext,
+        ctx: &mut VulkanContext,
         command_pool: vk::CommandPool,
         path: P,
     ) -> Self {
@@ -28,7 +30,7 @@ impl Texture {
 
     /// Create an sRGB texture from raw RGBA8 pixel data with the given dimensions.
     pub fn from_rgba8(
-        ctx: &VulkanContext,
+        ctx: &mut VulkanContext,
         command_pool: vk::CommandPool,
         pixels: &[u8],
         width: u32,
@@ -46,7 +48,7 @@ impl Texture {
 
     /// Create a texture from raw RGBA8 pixel data with an explicit Vulkan format.
     pub fn from_rgba8_with_format(
-        ctx: &VulkanContext,
+        ctx: &mut VulkanContext,
         command_pool: vk::CommandPool,
         pixels: &[u8],
         width: u32,
@@ -74,20 +76,22 @@ impl Texture {
         );
 
         // Staging buffer with pixel data.
-        let staging = create_buffer(
+        let mut staging = ctx.allocator.create_buffer(
             device,
+            "TextureStaging",
             size,
             vk::BufferUsageFlags::TRANSFER_SRC,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-            &ctx.instance,
-            ctx.physical_device,
+            MemoryLocation::CpuToGpu,
         );
+        let ptr = staging
+            .allocation
+            .as_ref()
+            .expect("texture staging: allocation missing")
+            .mapped_ptr()
+            .expect("texture staging: CpuToGpu allocation not mapped")
+            .as_ptr() as *mut u8;
         unsafe {
-            let ptr = device
-                .map_memory(staging.memory, 0, size, vk::MemoryMapFlags::empty())
-                .unwrap();
-            std::ptr::copy_nonoverlapping(pixels.as_ptr(), ptr as *mut u8, size as usize);
-            device.unmap_memory(staging.memory);
+            std::ptr::copy_nonoverlapping(pixels.as_ptr(), ptr, size as usize);
         }
 
         // Device-local image.
@@ -110,20 +114,10 @@ impl Texture {
             )
             .samples(vk::SampleCountFlags::TYPE_1)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let image = unsafe { device.create_image(&image_info, None).unwrap() };
-
-        let mem_reqs = unsafe { device.get_image_memory_requirements(image) };
-        let mem_type = find_memory_type(
-            &ctx.instance,
-            ctx.physical_device,
-            mem_reqs.memory_type_bits,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        );
-        let alloc_info = vk::MemoryAllocateInfo::default()
-            .allocation_size(mem_reqs.size)
-            .memory_type_index(mem_type);
-        let memory = unsafe { device.allocate_memory(&alloc_info, None).unwrap() };
-        unsafe { device.bind_image_memory(image, memory, 0).unwrap() };
+        let owned_img = ctx
+            .allocator
+            .create_image(device, "TextureImage", &image_info, MemoryLocation::GpuOnly);
+        let image = owned_img.image;
 
         // Upload via a single one-time command buffer:
         //   UNDEFINED -> TRANSFER_DST_OPTIMAL (all mip levels)
@@ -316,7 +310,8 @@ impl Texture {
             );
         });
 
-        unsafe { staging.destroy(device) };
+        // Free the staging buffer.
+        staging.destroy(device, &mut ctx.allocator);
 
         let view_info = vk::ImageViewCreateInfo::default()
             .image(image)
@@ -351,18 +346,23 @@ impl Texture {
 
         Self {
             image,
-            memory,
+            allocation: owned_img.allocation,
             view,
             sampler,
         }
     }
 
-    pub unsafe fn destroy(&self, device: &ash::Device) {
+    pub unsafe fn destroy(&mut self, device: &ash::Device, allocator: &mut MemoryAllocator) {
         unsafe {
             device.destroy_sampler(self.sampler, None);
             device.destroy_image_view(self.view, None);
             device.destroy_image(self.image, None);
-            device.free_memory(self.memory, None);
+        }
+        if let Some(allocation) = self.allocation.take() {
+            allocator
+                .inner
+                .free(allocation)
+                .expect("Failed to free texture allocation");
         }
     }
 }

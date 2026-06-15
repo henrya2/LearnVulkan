@@ -1,14 +1,17 @@
 use ash::vk;
+use gpu_allocator::MemoryLocation;
 use ktx2::Reader;
 
-use crate::vulkan::buffer::{create_buffer, with_one_time_command};
+use crate::vulkan::buffer::with_one_time_command;
 use crate::vulkan::context::VulkanContext;
 use crate::vulkan::cubemap::Cubemap;
 
 pub fn load_ktx2_cubemap(
-    ctx: &VulkanContext,
+    ctx: &mut VulkanContext,
     command_pool: vk::CommandPool,
     path: &str,
+    name: &str,
+    dedicated: bool,
 ) -> Cubemap {
     let file_data = std::fs::read(path)
         .unwrap_or_else(|e| panic!("Failed to read KTX2 file '{}': {}", path, e));
@@ -38,14 +41,15 @@ pub fn load_ktx2_cubemap(
         f => panic!("Unsupported KTX2 format: {:?}", f),
     };
 
-    let cubemap = Cubemap::create_empty(
+    let cubemap = Cubemap::create(
+        &mut ctx.allocator,
         &ctx.device,
-        &ctx.instance,
-        ctx.physical_device,
+        name,
         size,
         mip_levels,
         format,
         vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+        dedicated,
     );
 
     // Transition entire image to TRANSFER_DST
@@ -84,28 +88,23 @@ pub fn load_ktx2_cubemap(
         let face_size_bytes = (level_size * level_size) as u64 * bytes_per_pixel as u64;
         let level_data = *level;
 
-        // Create staging buffer for the entire level
-        let staging = create_buffer(
+        // Create staging buffer for the entire level.
+        let mut staging = ctx.allocator.create_buffer(
             &ctx.device,
+            &format!("{name}_Lvl{level_idx}_Staging"),
             level_data.len() as vk::DeviceSize,
             vk::BufferUsageFlags::TRANSFER_SRC,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-            &ctx.instance,
-            ctx.physical_device,
+            MemoryLocation::CpuToGpu,
         );
-
+        let ptr = staging
+            .allocation
+            .as_ref()
+            .expect("ktx2 staging: allocation missing")
+            .mapped_ptr()
+            .expect("ktx2 staging: CpuToGpu allocation not mapped")
+            .as_ptr() as *mut u8;
         unsafe {
-            let ptr = ctx
-                .device
-                .map_memory(
-                    staging.memory,
-                    0,
-                    level_data.len() as vk::DeviceSize,
-                    vk::MemoryMapFlags::empty(),
-                )
-                .unwrap();
-            std::ptr::copy_nonoverlapping(level_data.as_ptr(), ptr as *mut u8, level_data.len());
-            ctx.device.unmap_memory(staging.memory);
+            std::ptr::copy_nonoverlapping(level_data.as_ptr(), ptr, level_data.len());
         }
 
         // Copy each face from the staging buffer
@@ -137,7 +136,8 @@ pub fn load_ktx2_cubemap(
             }
         });
 
-        unsafe { staging.destroy(&ctx.device) };
+        // Free the staging allocation.
+        staging.destroy(&ctx.device, &mut ctx.allocator);
     }
 
     // Transition to SHADER_READ_ONLY

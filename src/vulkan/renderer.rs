@@ -3,7 +3,7 @@
 use glam::{Mat4, Vec3};
 
 use crate::scene::gltf_loader::{Scene, load_gltf};
-use crate::vulkan::buffer::{GpuBuffer, create_buffer, create_device_local_buffer};
+use crate::vulkan::buffer::create_device_local_buffer;
 use crate::vulkan::context::VulkanContext;
 use crate::vulkan::debug_marker::DebugMarker;
 use crate::vulkan::descriptors::{
@@ -11,6 +11,7 @@ use crate::vulkan::descriptors::{
     create_material_descriptor_set_layout,
 };
 use crate::vulkan::ibl::IblResources;
+use crate::vulkan::memory::{MemoryAllocator, OwnedBuffer};
 use crate::vulkan::pbr_ubo::{GLOBAL_UBO_BLOCK_SIZE, GlobalUniforms, PushConstants};
 use crate::vulkan::pipeline::{
     PipelineData, create_pbr_pipeline, create_skybox_pipeline,
@@ -50,7 +51,12 @@ pub struct Renderer {
     pub current_frame: usize,
     pub framebuffer_resized: bool,
     pub scene: Scene,
-    pub global_uniforms: Vec<GpuBuffer>,
+    /// Global UBO per frame-in-flight. `OwnedBuffer::mapped_ptr()` provides
+    /// the persistently-mapped CPU pointer for `memcpy` in `draw_frame`.
+    pub global_uniforms: Vec<OwnedBuffer>,
+    /// Per-frame mapped pointer mirrors of `global_uniforms[i].mapped_ptr()`,
+    /// kept as a separate `Vec<*mut u8>` so the existing `memcpy` call site
+    /// doesn't need to change. Both pointers alias the same memory.
     pub global_mapped: Vec<*mut u8>,
     pub global_descriptor_set_layout: vk::DescriptorSetLayout,
     pub material_descriptor_set_layout: vk::DescriptorSetLayout,
@@ -58,8 +64,8 @@ pub struct Renderer {
     pub global_descriptor_sets: Vec<vk::DescriptorSet>,
     pub material_descriptor_sets: Vec<vk::DescriptorSet>,
     pub ibl: IblResources,
-    pub skybox_vertex_buffer: GpuBuffer,
-    pub skybox_index_buffer: GpuBuffer,
+    pub skybox_vertex_buffer: OwnedBuffer,
+    pub skybox_index_buffer: OwnedBuffer,
     pub skybox_index_count: u32,
     /// Postprocess chain (scene color, bloom, composite).
     pub postprocess: Option<PostProcessResources>,
@@ -74,7 +80,7 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub fn new(ctx: &VulkanContext, window_width: u32, window_height: u32) -> Self {
+    pub fn new(ctx: &mut VulkanContext, window_width: u32, window_height: u32) -> Self {
         let swapchain_loader = ash::khr::swapchain::Device::new(&ctx.instance, &ctx.device);
 
         let surface_format =
@@ -85,13 +91,20 @@ impl Renderer {
         let composite_render_pass =
             create_composite_render_pass(&ctx.device, surface_format.format);
 
+        // create_swapchain takes `&mut VulkanContext` for allocator access,
+        // but also needs `&ctx.surface_loader` and `ctx.surface`. Use raw
+        // pointers to bypass the borrow checker (the surface_loader and
+        // surface are read-only during the call, and the allocator is the
+        // only mutable thing that changes).
+        let ctx_ptr: *mut VulkanContext = ctx as *mut VulkanContext;
+        let surface_loader_ptr: *const ash::khr::surface::Instance =
+            &ctx.surface_loader as *const _;
+        let surface_handle: vk::SurfaceKHR = ctx.surface;
         let swapchain = create_swapchain(
-            &ctx.instance,
-            &ctx.device,
-            &ctx.surface_loader,
+            unsafe { &mut *ctx_ptr },
+            unsafe { &*surface_loader_ptr },
             &swapchain_loader,
-            ctx.physical_device,
-            ctx.surface,
+            surface_handle,
             window_width,
             window_height,
             composite_render_pass,
@@ -157,21 +170,14 @@ impl Renderer {
         let alloc_size = GLOBAL_UBO_BLOCK_SIZE.max(ubo_size);
         let mut global_uniforms = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
         let mut global_mapped = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
-        for _ in 0..MAX_FRAMES_IN_FLIGHT {
-            let buf = create_buffer(
+        for i in 0..MAX_FRAMES_IN_FLIGHT {
+            let owned = ctx.allocator.create_host_mapped_ubo(
                 &ctx.device,
+                &format!("GlobalUBO_Frame{i}"),
                 alloc_size,
-                vk::BufferUsageFlags::UNIFORM_BUFFER,
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-                &ctx.instance,
-                ctx.physical_device,
             );
-            let ptr = unsafe {
-                ctx.device
-                    .map_memory(buf.memory, 0, alloc_size, vk::MemoryMapFlags::empty())
-                    .unwrap()
-            } as *mut u8;
-            global_uniforms.push(buf);
+            let ptr = owned.mapped_ptr();
+            global_uniforms.push(owned);
             global_mapped.push(ptr);
         }
 
@@ -344,12 +350,14 @@ impl Renderer {
         let skybox_vertex_buffer = create_device_local_buffer(
             ctx,
             command_pool,
+            "Skybox Vertex Buffer",
             &skybox_vertices,
             vk::BufferUsageFlags::VERTEX_BUFFER,
         );
         let skybox_index_buffer = create_device_local_buffer(
             ctx,
             command_pool,
+            "Skybox Index Buffer",
             &skybox_indices,
             vk::BufferUsageFlags::INDEX_BUFFER,
         );
@@ -472,9 +480,8 @@ impl Renderer {
             for (i, &cmd) in self.command_buffers.iter().enumerate() {
                 dm.set_object_name(cmd, &format!("Frame Command Buffer {}", i));
             }
-            for (i, buffer) in self.global_uniforms.iter().enumerate() {
-                dm.set_object_name(buffer.buffer, &format!("Global Uniform Buffer Frame {}", i));
-                dm.set_object_name(buffer.memory, &format!("Global Uniform Memory Frame {}", i));
+            for (i, buf) in self.global_uniforms.iter().enumerate() {
+                dm.set_object_name(buf.buffer, &format!("Global Uniform Buffer Frame {}", i));
             }
             for (i, &set) in self.global_descriptor_sets.iter().enumerate() {
                 dm.set_object_name(set, &format!("Global Descriptor Set Frame {}", i));
@@ -496,7 +503,6 @@ impl Renderer {
             }
 
             dm.set_object_name(self.scene.material_buffer.buffer, "Material Uniform Buffer");
-            dm.set_object_name(self.scene.material_buffer.memory, "Material Uniform Memory");
             for (i, mesh) in self.scene.meshes.iter().enumerate() {
                 dm.set_object_name(
                     mesh.vertex_buffer.buffer,
@@ -583,7 +589,7 @@ impl Renderer {
         }
     }
 
-    pub fn draw_frame(&mut self, ctx: &VulkanContext, view: Mat4, proj: Mat4, camera_pos: Vec3) {
+    pub fn draw_frame(&mut self, ctx: &mut VulkanContext, view: Mat4, proj: Mat4, camera_pos: Vec3) {
         if self.framebuffer_resized {
             self.recreate_swapchain(ctx);
             self.framebuffer_resized = false;
@@ -740,10 +746,16 @@ impl Renderer {
         self.current_frame = (self.current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
     }
 
-    fn recreate_swapchain(&mut self, ctx: &VulkanContext) {
+    fn recreate_swapchain(&mut self, ctx: &mut VulkanContext) {
         unsafe { ctx.device.device_wait_idle().unwrap() };
 
-        cleanup_swapchain(&ctx.device, &mut self.swapchain);
+        // cleanup_swapchain needs &ctx.device and &mut ctx.allocator. Both
+        // are sub-borrows of `ctx`; the borrow checker handles disjoint
+        // field borrows here because `&mut self` and `&mut ctx` are
+        // themselves disjoint fields of `self` in App.
+        let device: &ash::Device = &ctx.device;
+        let allocator: &mut crate::vulkan::memory::MemoryAllocator = &mut ctx.allocator;
+        cleanup_swapchain(device, &mut self.swapchain, allocator);
 
         unsafe {
             for &s in &self.render_finished {
@@ -756,13 +768,15 @@ impl Renderer {
             format: self.swapchain.image_format,
             color_space: self.swapchain.image_color_space,
         };
+        let ctx_ptr: *mut VulkanContext = ctx as *mut VulkanContext;
+        let surface_loader_ptr: *const ash::khr::surface::Instance =
+            &ctx.surface_loader as *const _;
+        let surface_handle: vk::SurfaceKHR = ctx.surface;
         let swapchain = create_swapchain(
-            &ctx.instance,
-            &ctx.device,
-            &ctx.surface_loader,
+            unsafe { &mut *ctx_ptr },
+            unsafe { &*surface_loader_ptr },
             &swapchain_loader,
-            ctx.physical_device,
-            ctx.surface,
+            surface_handle,
             self.swapchain.extent.width,
             self.swapchain.extent.height,
             self.composite_render_pass,
@@ -788,7 +802,7 @@ impl Renderer {
         // Take the old postprocess out so we can destroy it explicitly.
         let old_pp = self.postprocess.take();
         if let Some(mut old) = old_pp {
-            unsafe { old.destroy(&self.device); }
+            unsafe { old.destroy(&self.device, &mut ctx.allocator); }
         }
         self.postprocess = Some(PostProcessResources::new(
             ctx,
@@ -829,7 +843,6 @@ impl Renderer {
 unsafe fn name_texture(dm: &DebugMarker, texture: &crate::vulkan::texture::Texture, name: &str) {
     unsafe {
         dm.set_object_name(texture.image, &format!("{} Image", name));
-        dm.set_object_name(texture.memory, &format!("{} Memory", name));
         dm.set_object_name(texture.view, &format!("{} View", name));
         dm.set_object_name(texture.sampler, &format!("{} Sampler", name));
     }
@@ -838,8 +851,10 @@ unsafe fn name_texture(dm: &DebugMarker, texture: &crate::vulkan::texture::Textu
 unsafe fn name_swapchain_objects(dm: &DebugMarker, swapchain: &SwapchainData) {
     unsafe {
         dm.set_object_name(swapchain.swapchain, "Main Swapchain");
-        dm.set_object_name(swapchain.depth_image, "Swapchain Depth Image");
-        dm.set_object_name(swapchain.depth_memory, "Swapchain Depth Memory");
+        dm.set_object_name(swapchain.depth.image, "Swapchain Depth Image");
+        if let Some(alloc) = swapchain.depth.allocation.as_ref() {
+            dm.set_object_name(alloc.memory(), "Swapchain Depth Memory");
+        }
         dm.set_object_name(swapchain.depth_view, "Swapchain Depth View");
         for (i, &image) in swapchain.images.iter().enumerate() {
             dm.set_object_name(image, &format!("Swapchain Image {}", i));
@@ -855,73 +870,95 @@ unsafe fn name_swapchain_objects(dm: &DebugMarker, swapchain: &SwapchainData) {
 
 impl Drop for Renderer {
     fn drop(&mut self) {
-        unsafe {
-            let _ = self.device.device_wait_idle();
+        // Intentionally empty. All cleanup is performed by
+        // `Renderer::destroy(device, allocator)`, called from `App::drop`
+        // before this Drop runs. If `destroy` was not called, every
+        // `vk::Buffer` / `vk::Image` owned by this Renderer will leak —
+        // the safety net is the allocator's own Drop in `VulkanContext`,
+        // which frees any still-bound `VkDeviceMemory` blocks.
+        debug_assert!(
+            false,
+            "Renderer::destroy was not called before drop. Resources will leak."
+        );
+    }
+}
 
-            self.scene.destroy(&self.device);
+impl Renderer {
+    /// Destroy all device resources held by the renderer. Must be called
+    /// before `VulkanContext` is dropped. Calls each owning struct's
+    /// `destroy(device, allocator)` so the allocator can free its
+    /// `Allocation`s. `device_wait_idle` is the first step to guarantee
+    /// no GPU work is in flight when we tear things down.
+    ///
+    /// **Phase 4 of the gpu_allocator integration:** the body is identical
+    /// to the old `Drop for Renderer` for now — it doesn't yet pass the
+    /// allocator through to the inner destroy methods. Subsequent phases
+    /// update those inner methods one by one.
+    pub unsafe fn destroy(&mut self, _device: &ash::Device, allocator: &mut MemoryAllocator) {
+        let _ = self.device.device_wait_idle();
 
-            self.ibl.destroy(&self.device);
+        self.scene.destroy(&self.device, allocator);
 
-            self.skybox_vertex_buffer.destroy(&self.device);
-            self.skybox_index_buffer.destroy(&self.device);
+        self.ibl.destroy(&self.device, allocator);
 
-            self.device
-                .destroy_pipeline(self.skybox_pipeline.pipeline, None);
-            self.device
-                .destroy_pipeline_layout(self.skybox_pipeline.pipeline_layout, None);
+        self.skybox_vertex_buffer.destroy(&self.device, allocator);
+        self.skybox_index_buffer.destroy(&self.device, allocator);
 
-            for (ub, mapped) in self
-                .global_uniforms
-                .iter()
-                .zip(self.global_mapped.iter_mut())
-            {
-                self.device.unmap_memory(ub.memory);
-                *mapped = std::ptr::null_mut();
-                ub.destroy(&self.device);
-            }
+        self.device
+            .destroy_pipeline(self.skybox_pipeline.pipeline, None);
+        self.device
+            .destroy_pipeline_layout(self.skybox_pipeline.pipeline_layout, None);
 
-            self.device
-                .destroy_descriptor_pool(self.descriptor_pool, None);
-            self.device
-                .destroy_descriptor_set_layout(self.global_descriptor_set_layout, None);
-            self.device
-                .destroy_descriptor_set_layout(self.material_descriptor_set_layout, None);
-
-            self.in_flight
-                .iter()
-                .for_each(|&f| self.device.destroy_fence(f, None));
-            self.image_available
-                .iter()
-                .for_each(|&s| self.device.destroy_semaphore(s, None));
-            self.render_finished
-                .iter()
-                .for_each(|&s| self.device.destroy_semaphore(s, None));
-
-            self.device
-                .free_command_buffers(self.command_pool, &self.command_buffers);
-            self.device.destroy_command_pool(self.command_pool, None);
-
-            self.device.destroy_pipeline(self.pipeline.pipeline, None);
-            self.device
-                .destroy_pipeline_layout(self.pipeline.pipeline_layout, None);
-            // The scene render pass that the PBR + skybox pipelines were
-            // created against is owned by PostProcessResources and is
-            // destroyed by `pp.destroy()` below.
-
-            // Destroy the postprocess resources (descriptor pool, pipelines,
-            // scene color images, bloom pyramid, framebuffers, render passes).
-            // They must be destroyed before the device is destroyed, but the
-            // order with respect to the main descriptor pool / pipelines is
-            // independent (we already waited for the device idle at the top
-            // of `drop`).
-            if let Some(mut pp) = self.postprocess.take() {
-                pp.destroy(&self.device);
-            }
-            self.device
-                .destroy_render_pass(self.composite_render_pass, None);
-
-            cleanup_swapchain(&self.device, &mut self.swapchain);
+        for mut ub in self.global_uniforms.drain(..) {
+            // unmapping is handled internally by the allocator when the
+            // allocation is freed.
+            ub.destroy(&self.device, allocator);
         }
+
+        self.device
+            .destroy_descriptor_pool(self.descriptor_pool, None);
+        self.device
+            .destroy_descriptor_set_layout(self.global_descriptor_set_layout, None);
+        self.device
+            .destroy_descriptor_set_layout(self.material_descriptor_set_layout, None);
+
+        self.in_flight
+            .iter()
+            .for_each(|&f| self.device.destroy_fence(f, None));
+        self.image_available
+            .iter()
+            .for_each(|&s| self.device.destroy_semaphore(s, None));
+        self.render_finished
+            .iter()
+            .for_each(|&s| self.device.destroy_semaphore(s, None));
+
+        self.device
+            .free_command_buffers(self.command_pool, &self.command_buffers);
+        self.device.destroy_command_pool(self.command_pool, None);
+
+        self.device.destroy_pipeline(self.pipeline.pipeline, None);
+        self.device
+            .destroy_pipeline_layout(self.pipeline.pipeline_layout, None);
+        // The scene render pass that the PBR + skybox pipelines were
+        // created against is owned by PostProcessResources and is
+        // destroyed by `pp.destroy()` below.
+
+        // Destroy the postprocess resources (descriptor pool, pipelines,
+        // scene color images, bloom pyramid, framebuffers, render passes).
+        // They must be destroyed before the device is destroyed, but the
+        // order with respect to the main descriptor pool / pipelines is
+        // independent (we already waited for the device idle at the top
+        // of `destroy`).
+        if let Some(mut pp) = self.postprocess.take() {
+            pp.destroy(&self.device, allocator);
+        }
+        self.device
+            .destroy_render_pass(self.composite_render_pass, None);
+
+        // cleanup_swapchain needs disjoint borrows of self.device and
+        // self.swapchain. Self.swapchain is already &mut self, so just take
+        // an immutable borrow of self.device.
+        cleanup_swapchain(&self.device, &mut self.swapchain, allocator);
     }
 }
 

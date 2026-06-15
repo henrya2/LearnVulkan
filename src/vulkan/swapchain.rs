@@ -1,5 +1,8 @@
 use ash::vk;
 
+use crate::vulkan::context::VulkanContext;
+use crate::vulkan::memory::{MemoryAllocator, OwnedImage};
+
 pub struct SwapchainData {
     pub swapchain: vk::SwapchainKHR,
     pub swapchain_loader: ash::khr::swapchain::Device,
@@ -9,8 +12,7 @@ pub struct SwapchainData {
     pub extent: vk::Extent2D,
     pub image_format: vk::Format,
     pub image_color_space: vk::ColorSpaceKHR,
-    pub depth_image: vk::Image,
-    pub depth_memory: vk::DeviceMemory,
+    pub depth: OwnedImage,
     pub depth_view: vk::ImageView,
     #[allow(dead_code)]
     pub depth_format: vk::Format,
@@ -67,17 +69,18 @@ pub fn find_depth_format(
 }
 
 pub fn create_swapchain(
-    instance: &ash::Instance,
-    device: &ash::Device,
+    ctx: &mut VulkanContext,
     surface_loader: &ash::khr::surface::Instance,
     swapchain_loader: &ash::khr::swapchain::Device,
-    physical_device: vk::PhysicalDevice,
     surface: vk::SurfaceKHR,
     window_width: u32,
     window_height: u32,
     composite_render_pass: vk::RenderPass,
     surface_format: vk::SurfaceFormatKHR,
 ) -> SwapchainData {
+    let device = &ctx.device;
+    let physical_device = ctx.physical_device;
+
     let caps = unsafe {
         surface_loader
             .get_physical_device_surface_capabilities(physical_device, surface)
@@ -152,48 +155,28 @@ pub fn create_swapchain(
         })
         .collect();
 
-    let depth_format = find_depth_format(instance, physical_device);
+    let depth_format = find_depth_format(&ctx.instance, physical_device);
 
-    let depth_image = {
-        let info = vk::ImageCreateInfo::default()
-            .image_type(vk::ImageType::TYPE_2D)
-            .extent(vk::Extent3D {
-                width: extent.width,
-                height: extent.height,
-                depth: 1,
-            })
-            .mip_levels(1)
-            .array_layers(1)
-            .format(depth_format)
-            .tiling(vk::ImageTiling::OPTIMAL)
-            .initial_layout(vk::ImageLayout::UNDEFINED)
-            .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .samples(vk::SampleCountFlags::TYPE_1);
-        unsafe { device.create_image(&info, None).unwrap() }
-    };
-
-    let depth_memory = {
-        let mem_reqs = unsafe { device.get_image_memory_requirements(depth_image) };
-        let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
-        let mut mem_type_index = u32::MAX;
-        for i in 0..mem_props.memory_type_count {
-            if (mem_reqs.memory_type_bits & (1 << i)) != 0
-                && mem_props.memory_types[i as usize]
-                    .property_flags
-                    .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
-            {
-                mem_type_index = i;
-                break;
-            }
-        }
-        let alloc_info = vk::MemoryAllocateInfo::default()
-            .allocation_size(mem_reqs.size)
-            .memory_type_index(mem_type_index);
-        let mem = unsafe { device.allocate_memory(&alloc_info, None).unwrap() };
-        unsafe { device.bind_image_memory(depth_image, mem, 0).unwrap() };
-        mem
-    };
+    let depth_info = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .extent(vk::Extent3D {
+            width: extent.width,
+            height: extent.height,
+            depth: 1,
+        })
+        .mip_levels(1)
+        .array_layers(1)
+        .format(depth_format)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .samples(vk::SampleCountFlags::TYPE_1);
+    // Depth is recreated on every swapchain resize — use a dedicated block
+    // so resize churn does not perturb the sub-allocator pool.
+    let depth = ctx
+        .allocator
+        .create_dedicated_image(device, "SwapchainDepth", &depth_info);
 
     let depth_view = {
         let aspect = if depth_format == vk::Format::D32_SFLOAT {
@@ -202,7 +185,7 @@ pub fn create_swapchain(
             vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL
         };
         let info = vk::ImageViewCreateInfo::default()
-            .image(depth_image)
+            .image(depth.image)
             .view_type(vk::ImageViewType::TYPE_2D)
             .format(depth_format)
             .subresource_range(vk::ImageSubresourceRange {
@@ -243,21 +226,20 @@ pub fn create_swapchain(
         extent,
         image_format: surface_format.format,
         image_color_space: surface_format.color_space,
-        depth_image,
-        depth_memory,
+        depth,
         depth_view,
         depth_format,
     }
 }
 
-pub fn cleanup_swapchain(device: &ash::Device, data: &mut SwapchainData) {
+pub fn cleanup_swapchain(device: &ash::Device, data: &mut SwapchainData, allocator: &mut MemoryAllocator) {
     unsafe {
         for &fb in &data.framebuffers {
             device.destroy_framebuffer(fb, None);
         }
         device.destroy_image_view(data.depth_view, None);
-        device.destroy_image(data.depth_image, None);
-        device.free_memory(data.depth_memory, None);
+        // Depth image + its dedicated allocation.
+        data.depth.destroy(device, allocator);
         for &view in &data.image_views {
             device.destroy_image_view(view, None);
         }

@@ -18,6 +18,21 @@ struct AppHandler {
     enable_gpu_assisted: bool,
     width: u32,
     height: u32,
+    /// Frame counter, decremented on each `RedrawRequested`. When it hits 0
+    /// the app exits cleanly. `None` means "run until window close" (the
+    /// normal interactive mode).
+    frames_remaining: Option<u32>,
+}
+
+impl AppHandler {
+    fn try_finish_run(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(remaining) = self.frames_remaining {
+            if remaining == 0 {
+                println!("RUN_FRAMES_DONE");
+                event_loop.exit();
+            }
+        }
+    }
 }
 
 impl ApplicationHandler for AppHandler {
@@ -47,6 +62,12 @@ impl ApplicationHandler for AppHandler {
             WindowEvent::RedrawRequested => {
                 app.draw_frame();
                 app.window().request_redraw();
+                if let Some(ref mut remaining) = self.frames_remaining {
+                    if *remaining > 0 {
+                        *remaining -= 1;
+                    }
+                }
+                self.try_finish_run(event_loop);
             }
             WindowEvent::KeyboardInput { event, .. } => app.on_keyboard(&event),
             WindowEvent::MouseInput { button, state, .. } => app.on_mouse_button(button, state),
@@ -84,6 +105,29 @@ fn parse_resolution() -> (u32, u32) {
     (800, 600)
 }
 
+/// Parse `--run-frames` and `--frames=N` flags. Returns `Some(N)` if either
+/// is present, `None` otherwise. `--frames` overrides the bare `--run-frames`
+/// count (which defaults to 120 per the test harness convention).
+fn parse_run_frames() -> Option<u32> {
+    let args: Vec<String> = std::env::args().collect();
+    let mut explicit = None;
+    let mut has_flag = false;
+    for arg in &args {
+        if arg == "--run-frames" {
+            has_flag = true;
+        } else if let Some(v) = arg.strip_prefix("--frames=") {
+            explicit = v.parse::<u32>().ok();
+        }
+    }
+    if explicit.is_some() {
+        explicit
+    } else if has_flag {
+        Some(120)
+    } else {
+        None
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let enable_validation = args
@@ -99,6 +143,7 @@ fn main() {
     });
 
     let (width, height) = parse_resolution();
+    let frames_remaining = parse_run_frames();
 
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(ControlFlow::Poll);
@@ -108,6 +153,7 @@ fn main() {
         enable_gpu_assisted,
         width,
         height,
+        frames_remaining,
     };
     event_loop.run_app(&mut handler).unwrap();
 }

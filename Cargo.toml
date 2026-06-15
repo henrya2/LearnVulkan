@@ -13,3 +13,4 @@ bytemuck = { version = "1", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 gltf = { version = "1.4", features = ["import", "utils"] }
 ktx2 = "0.3"
+gpu-allocator = "0.28"

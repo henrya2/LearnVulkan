@@ -2,8 +2,8 @@
 
 use ash::vk;
 
-use crate::vulkan::buffer::find_memory_type;
 use crate::vulkan::context::VulkanContext;
+use crate::vulkan::memory::{MemoryAllocator, OwnedImage};
 
 /// Number of mip levels in the bloom pyramid.
 pub const BLOOM_MIP_COUNT: usize = 8;
@@ -23,17 +23,14 @@ pub const BLOOM_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 pub struct BloomPyramid {
     pub mip_views: Vec<vk::ImageView>,
     pub temp_views: Vec<vk::ImageView>,
-    mip_image: vk::Image,
-    mip_memory: vk::DeviceMemory,
-    temp_image: vk::Image,
-    temp_memory: vk::DeviceMemory,
+    pub mip: OwnedImage,
+    pub temp: OwnedImage,
     pub sampler: vk::Sampler,
 }
 
 impl BloomPyramid {
-    pub fn new(ctx: &VulkanContext, width: u32, height: u32) -> Self {
+    pub fn new(ctx: &mut VulkanContext, width: u32, height: u32) -> Self {
         assert!(width > 0 && height > 0, "bloom extent must be positive");
-        let device = &ctx.device;
 
         let sampler_info = vk::SamplerCreateInfo::default()
             .mag_filter(vk::Filter::LINEAR)
@@ -51,27 +48,26 @@ impl BloomPyramid {
             .mip_lod_bias(0.0)
             .min_lod(0.0)
             .max_lod(0.0);
-        let sampler = unsafe { device.create_sampler(&sampler_info, None).unwrap() };
+        let sampler = unsafe { ctx.device.create_sampler(&sampler_info, None).unwrap() };
 
-        let (mip_image, mip_memory) =
-            create_mip_image(device, ctx, width, height, BLOOM_MIP_COUNT as u32);
-        let (temp_image, temp_memory) =
-            create_mip_image(device, ctx, width, height, BLOOM_MIP_COUNT as u32);
+        let mip = create_mip_image(ctx, width, height, BLOOM_MIP_COUNT as u32, "BloomMipImage");
+        let temp = create_mip_image(ctx, width, height, BLOOM_MIP_COUNT as u32, "BloomTempImage");
+
+        let mip_image_handle = mip.image;
+        let temp_image_handle = temp.image;
 
         let mut mip_views = Vec::with_capacity(BLOOM_MIP_COUNT);
         let mut temp_views = Vec::with_capacity(BLOOM_MIP_COUNT);
         for level in 0..BLOOM_MIP_COUNT {
-            mip_views.push(create_mip_view(device, mip_image, level as u32));
-            temp_views.push(create_mip_view(device, temp_image, level as u32));
+            mip_views.push(create_mip_view(&ctx.device, mip_image_handle, level as u32));
+            temp_views.push(create_mip_view(&ctx.device, temp_image_handle, level as u32));
         }
 
         Self {
             mip_views,
             temp_views,
-            mip_image,
-            mip_memory,
-            temp_image,
-            temp_memory,
+            mip,
+            temp,
             sampler,
         }
     }
@@ -89,15 +85,15 @@ impl BloomPyramid {
 
     /// Return the underlying mip image handle, useful for barriers.
     pub fn mip_image(&self) -> vk::Image {
-        self.mip_image
+        self.mip.image
     }
 
     /// Return the underlying temp image handle, useful for barriers.
     pub fn temp_image(&self) -> vk::Image {
-        self.temp_image
+        self.temp.image
     }
 
-    pub unsafe fn destroy(&mut self, device: &ash::Device) {
+    pub unsafe fn destroy(&mut self, device: &ash::Device, allocator: &mut MemoryAllocator) {
         unsafe {
             for view in self.mip_views.drain(..) {
                 device.destroy_image_view(view, None);
@@ -105,22 +101,25 @@ impl BloomPyramid {
             for view in self.temp_views.drain(..) {
                 device.destroy_image_view(view, None);
             }
-            device.destroy_image(self.mip_image, None);
-            device.free_memory(self.mip_memory, None);
-            device.destroy_image(self.temp_image, None);
-            device.free_memory(self.temp_memory, None);
+            // Use raw pointers to release the mip/temp images' allocations.
+            // Each gets its own dedicated VkDeviceMemory block to isolate
+            // swapchain-resize churn from the main DEVICE_LOCAL pool.
+            let mip_ptr: *mut OwnedImage = &mut self.mip as *mut OwnedImage;
+            let temp_ptr: *mut OwnedImage = &mut self.temp as *mut OwnedImage;
+            (*mip_ptr).destroy(device, allocator);
+            (*temp_ptr).destroy(device, allocator);
             device.destroy_sampler(self.sampler, None);
         }
     }
 }
 
 fn create_mip_image(
-    device: &ash::Device,
-    ctx: &VulkanContext,
+    ctx: &mut VulkanContext,
     width: u32,
     height: u32,
     mip_levels: u32,
-) -> (vk::Image, vk::DeviceMemory) {
+    name: &str,
+) -> OwnedImage {
     let extent = vk::Extent3D {
         width,
         height,
@@ -142,22 +141,11 @@ fn create_mip_image(
         )
         .samples(vk::SampleCountFlags::TYPE_1)
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
-    let image = unsafe { device.create_image(&image_info, None).unwrap() };
-
-    let mem_reqs = unsafe { device.get_image_memory_requirements(image) };
-    let mem_type = find_memory_type(
-        &ctx.instance,
-        ctx.physical_device,
-        mem_reqs.memory_type_bits,
-        vk::MemoryPropertyFlags::DEVICE_LOCAL,
-    );
-    let alloc_info = vk::MemoryAllocateInfo::default()
-        .allocation_size(mem_reqs.size)
-        .memory_type_index(mem_type);
-    let memory = unsafe { device.allocate_memory(&alloc_info, None).unwrap() };
-    unsafe { device.bind_image_memory(image, memory, 0).unwrap() };
-
-    (image, memory)
+    // Use a dedicated allocation: bloom mip/temp images are recreated on
+    // every swapchain resize, so dedicated isolates that churn from the
+    // sub-allocator pool.
+    ctx.allocator
+        .create_dedicated_image(&ctx.device, name, &image_info)
 }
 
 fn create_mip_view(device: &ash::Device, image: vk::Image, level: u32) -> vk::ImageView {

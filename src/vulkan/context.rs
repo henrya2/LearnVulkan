@@ -1,7 +1,9 @@
 use crate::vulkan::debug_marker::DebugMarker;
+use crate::vulkan::memory::MemoryAllocator;
 use ash::vk;
 use raw_window_handle::{DisplayHandle, WindowHandle};
 use std::ffi::{CStr, CString, c_char};
+use std::mem::ManuallyDrop;
 
 pub struct VulkanContext {
     #[allow(dead_code)]
@@ -10,6 +12,11 @@ pub struct VulkanContext {
     pub surface: vk::SurfaceKHR,
     pub surface_loader: ash::khr::surface::Instance,
     pub physical_device: vk::PhysicalDevice,
+    /// `MemoryAllocator` is wrapped in `ManuallyDrop` so we can drop it
+    /// **before** `device` in `Drop for VulkanContext`. The allocator's
+    /// `Drop` calls `vkFreeMemory` which requires a live device. See
+    /// `docs/gpu_allocator_integration_plan.md` §9.3.
+    pub allocator: ManuallyDrop<MemoryAllocator>,
     pub device: ash::Device,
     pub graphics_queue: vk::Queue,
     pub present_queue: vk::Queue,
@@ -53,6 +60,12 @@ impl VulkanContext {
         let (device, graphics_queue, present_queue) =
             create_logical_device(&instance, physical_device, graphics_family, present_family);
 
+        let allocator = ManuallyDrop::new(MemoryAllocator::new(
+            instance.clone(),
+            device.clone(),
+            physical_device,
+        ));
+
         let debug_marker = DebugMarker::new(&instance, &device);
 
         Self {
@@ -61,6 +74,7 @@ impl VulkanContext {
             surface,
             surface_loader,
             physical_device,
+            allocator,
             device,
             graphics_queue,
             present_queue,
@@ -79,6 +93,13 @@ impl Drop for VulkanContext {
                 du.loader.destroy_debug_utils_messenger(du.messenger, None);
             }
             self.surface_loader.destroy_surface(self.surface, None);
+            // Drop the allocator BEFORE the device. The allocator's Drop
+            // calls `vkFreeMemory` for any still-live `VkDeviceMemory` blocks
+            // (should be zero if `Renderer::destroy` was called correctly).
+            // ManuallyDrop here because Rust's auto-drop of struct fields
+            // would drop `allocator` (a regular field) before `device`,
+            // but the explicit ordering makes the drop contract auditable.
+            ManuallyDrop::drop(&mut self.allocator);
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
         }

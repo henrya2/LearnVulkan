@@ -1,72 +1,57 @@
-use crate::vulkan::buffer::{find_memory_type, with_one_time_command};
+use crate::vulkan::buffer::with_one_time_command;
 use crate::vulkan::context::VulkanContext;
+use crate::vulkan::memory::MemoryAllocator;
 use ash::vk;
+use gpu_allocator::MemoryLocation;
 
 pub struct BrdfLut {
     pub image: vk::Image,
-    pub memory: vk::DeviceMemory,
+    pub allocation: Option<gpu_allocator::vulkan::Allocation>,
     pub view: vk::ImageView,
     pub sampler: vk::Sampler,
 }
 
 impl BrdfLut {
-    pub unsafe fn destroy(&self, device: &ash::Device) {
+    pub unsafe fn destroy(&mut self, device: &ash::Device, allocator: &mut MemoryAllocator) {
         unsafe {
             device.destroy_sampler(self.sampler, None);
             device.destroy_image_view(self.view, None);
             device.destroy_image(self.image, None);
-            device.free_memory(self.memory, None);
+        }
+        if let Some(allocation) = self.allocation.take() {
+            allocator
+                .inner
+                .free(allocation)
+                .expect("Failed to free BRDF LUT allocation");
         }
     }
 }
 
-pub fn generate_brdf_lut(ctx: &VulkanContext, command_pool: vk::CommandPool) -> BrdfLut {
+pub fn generate_brdf_lut(ctx: &mut VulkanContext, command_pool: vk::CommandPool) -> BrdfLut {
     let device = &ctx.device;
     let size = 512u32;
     let format = vk::Format::R16G16_SFLOAT;
 
-    // Create image
-    let image = unsafe {
-        device
-            .create_image(
-                &vk::ImageCreateInfo::default()
-                    .image_type(vk::ImageType::TYPE_2D)
-                    .format(format)
-                    .extent(vk::Extent3D {
-                        width: size,
-                        height: size,
-                        depth: 1,
-                    })
-                    .mip_levels(1)
-                    .array_layers(1)
-                    .samples(vk::SampleCountFlags::TYPE_1)
-                    .tiling(vk::ImageTiling::OPTIMAL)
-                    .initial_layout(vk::ImageLayout::UNDEFINED)
-                    .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
-                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
-                None,
-            )
-            .unwrap()
-    };
-
-    let mem_reqs = unsafe { device.get_image_memory_requirements(image) };
-    let memory = unsafe {
-        let mem_type = find_memory_type(
-            &ctx.instance,
-            ctx.physical_device,
-            mem_reqs.memory_type_bits,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        );
-        device
-            .allocate_memory(
-                &vk::MemoryAllocateInfo::default()
-                    .allocation_size(mem_reqs.size)
-                    .memory_type_index(mem_type),
-                None,
-            )
-            .unwrap()
-    };
-    unsafe { device.bind_image_memory(image, memory, 0).unwrap() };
+    // Create image via allocator
+    let image_info = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(format)
+        .extent(vk::Extent3D {
+            width: size,
+            height: size,
+            depth: 1,
+        })
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let owned = ctx
+        .allocator
+        .create_image(device, "BRDF_LUT", &image_info, MemoryLocation::GpuOnly);
+    let image = owned.image;
 
     let view = unsafe {
         device
@@ -318,7 +303,7 @@ pub fn generate_brdf_lut(ctx: &VulkanContext, command_pool: vk::CommandPool) -> 
 
     BrdfLut {
         image,
-        memory,
+        allocation: owned.allocation,
         view,
         sampler,
     }
