@@ -38,6 +38,7 @@ const POSTPROCESS_LABEL_COLOR: [f32; 4] = [0.8, 0.4, 0.6, 1.0];
 const ENV_BASE_PATH: &str = "assets/environment_map/ennis";
 
 pub struct Renderer {
+    destroyed: bool, 
     pub device: ash::Device,
     pub swapchain: SwapchainData,
     pub pipeline: PipelineData,
@@ -400,6 +401,7 @@ impl Renderer {
         let images_in_flight = vec![None; swapchain.images.len()];
 
         let renderer = Self {
+            destroyed: false,
             device: ctx.device.clone(),
             swapchain,
             pipeline,
@@ -877,7 +879,7 @@ impl Drop for Renderer {
         // the safety net is the allocator's own Drop in `VulkanContext`,
         // which frees any still-bound `VkDeviceMemory` blocks.
         debug_assert!(
-            false,
+            self.destroyed,
             "Renderer::destroy was not called before drop. Resources will leak."
         );
     }
@@ -895,6 +897,14 @@ impl Renderer {
     /// allocator through to the inner destroy methods. Subsequent phases
     /// update those inner methods one by one.
     pub unsafe fn destroy(&mut self, _device: &ash::Device, allocator: &mut MemoryAllocator) {
+        debug_assert!(
+            !self.destroyed,
+            "Renderer::destroy called more than once. Double-destroying resources will cause undefined behavior."
+        );
+        if self.destroyed {
+            return;
+        }
+
         let _ = self.device.device_wait_idle();
 
         self.scene.destroy(&self.device, allocator);
@@ -959,6 +969,8 @@ impl Renderer {
         // self.swapchain. Self.swapchain is already &mut self, so just take
         // an immutable borrow of self.device.
         cleanup_swapchain(&self.device, &mut self.swapchain, allocator);
+
+        self.destroyed = true;
     }
 }
 
