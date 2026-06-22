@@ -134,7 +134,8 @@ fn create_instance(
         extensions.push(ash::ext::validation_features::NAME.as_ptr());
     }
 
-    // GPU-assisted validation is opt-in via CLI; requires the validation layer.
+    // GPU-assisted validation is default-on in debug builds (controlled by
+    // the caller); requires the validation layer.
     let gpu_assisted_active = enable_validation && enable_gpu_assisted;
     let enabled_features: &[vk::ValidationFeatureEnableEXT] = if gpu_assisted_active {
         &[

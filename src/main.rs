@@ -135,12 +135,14 @@ fn main() {
         .any(|arg| arg == "--validation" || arg == "--validate")
         || cfg!(debug_assertions);
 
-    // GPU-assisted validation is opt-in (default off). It requires the
-    // validation layer, so the VulkanContext will silently ignore this flag
-    // if validation is not enabled.
+    // GPU-assisted validation is default-on in debug builds (where the
+    // validation layer is also on by default). It can be enabled in release
+    // builds via the CLI flags. It requires the validation layer, so
+    // VulkanContext will silently ignore this flag if validation is not
+    // enabled.
     let enable_gpu_assisted = args.iter().any(|arg| {
         arg == "--gpu-assisted" || arg == "--gpu_assisted" || arg == "--vgav"
-    });
+    }) || cfg!(debug_assertions);
 
     let (width, height) = parse_resolution();
     let frames_remaining = parse_run_frames();

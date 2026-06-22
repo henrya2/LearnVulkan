@@ -35,7 +35,7 @@ cargo run --release -- --validation
 
 ## Testing rules
 
-- **GPU-assisted validation must be turned on** to test whether a code or shader change is correct. Use the `--gpu-assisted` CLI flag (also accepted: `--gpu_assisted`, `--vgav`). It is opt-in and **defaults to off**. It requires the validation layer, so pass it together with `--validation` (or rely on the debug-build default that already enables validation). The flag is wired in `src/main.rs` -> `App::new` -> `VulkanContext::new` -> `create_instance` in `src/vulkan/context.rs`, where it enables `VK_VALIDATION_FEATURE_ENABLE_GPU_ASSISTED_EXT` plus `GPU_ASSISTED_RESERVE_BINDING_SLOT` on the instance.
+- **GPU-assisted validation is default-on in debug builds** (same as the validation layer). Use the `--gpu-assisted` CLI flag (also accepted: `--gpu_assisted`, `--vgav`) to enable it in release builds. It requires the validation layer, so pass it together with `--validation` (or rely on the debug-build default that already enables validation). The flag is wired in `src/main.rs` -> `App::new` -> `VulkanContext::new` -> `create_instance` in `src/vulkan/context.rs`, where it enables `VK_VALIDATION_FEATURE_ENABLE_GPU_ASSISTED_EXT` plus `GPU_ASSISTED_RESERVE_BINDING_SLOT` on the instance.
 
 `assets/models/DamagedHelmet/` must exist at runtime with the glTF model and its textures. The model is loaded at startup via `load_gltf`. `assets/environment_map/ennis/` must also exist at runtime — it provides the KTX2 cubemaps consumed by `IblResources::load` (see `ENV_BASE_PATH` in `src/vulkan/renderer.rs`).
 
@@ -172,7 +172,7 @@ Procedural mesh helpers:
   - `assets/models/DamagedHelmet/` is a runtime dependency containing the glTF model and its PBR textures (albedo, normal, metallic-roughness, AO, emissive).
   - `assets/environment_map/ennis/` is a runtime dependency containing the IBL cubemap (KTX2). The renderer reads from this project-relative path via `ENV_BASE_PATH` in `src/vulkan/renderer.rs`. Layout: `lambertian/outputCubeMap.ktx2` (env cubemap), `lambertian/diffuse.ktx2` (irradiance), `ggx/specular.ktx2` (prefilter).
 - **Debug markers**: RenderDoc labels and object names must work in every build configuration. Keep `VK_EXT_debug_utils` enabled independently of validation layers. Every pass and every resource must have proper debug markers. Postprocess resources are named in `PostProcessResources::name_debug_objects`. The postprocessing chain is wrapped in a "PostProcessing" debug group. Blur passes are labeled `"Bloom Mip N Horizontal/Vertical Blur"`.
-- **Validation layers**: `VK_LAYER_KHRONOS_validation` is enabled by default in debug builds and can be enabled in non-debug builds with `--validation` or `--validate`. GPU-assisted validation is an explicit opt-in via `--gpu-assisted` (also `--gpu_assisted`, `--vgav`) — see the **Testing rules** section above. A clean shutdown produces no validation errors.
+- **Validation layers**: `VK_LAYER_KHRONOS_validation` is enabled by default in debug builds and can be enabled in non-debug builds with `--validation` or `--validate`. GPU-assisted validation is enabled by default in debug builds alongside the validation layer; it can be enabled in release builds with `--gpu-assisted` (also `--gpu_assisted`, `--vgav`). A clean shutdown produces no validation errors.
 
 # Special notes
 @docs/winding_orientation.md
