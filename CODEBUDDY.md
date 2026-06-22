@@ -35,9 +35,24 @@ cargo run --release -- --validation
 
 ## Testing rules
 
-- **GPU-assisted validation is default-on in debug builds** (same as the validation layer). Use the `--gpu-assisted` CLI flag (also accepted: `--gpu_assisted`, `--vgav`) to enable it in release builds. It requires the validation layer, so pass it together with `--validation` (or rely on the debug-build default that already enables validation). The flag is wired in `src/main.rs` -> `App::new` -> `VulkanContext::new` -> `create_instance` in `src/vulkan/context.rs`, where it enables `VK_VALIDATION_FEATURE_ENABLE_GPU_ASSISTED_EXT` plus `GPU_ASSISTED_RESERVE_BINDING_SLOT` on the instance.
+### Required build targets
 
-`assets/models/DamagedHelmet/` must exist at runtime with the glTF model and its textures. The model is loaded at startup via `load_gltf`. `assets/environment_map/ennis/` must also exist at runtime — it provides the KTX2 cubemaps consumed by `IblResources::load` (see `ENV_BASE_PATH` in `src/vulkan/renderer.rs`).
+- **Every change that modifies code must be verified to compile, run, and shut down cleanly in both debug and release builds.** A change is not considered correct until both build profiles pass. Run `cargo build && cargo run` first, then `cargo build --release && cargo run --release`.
+- After modifying code, always build before running — do not assume compilation succeeds based on local reasoning.
+
+### GPU-assisted validation
+
+- GPU-assisted validation is **enabled by default in debug builds** (tied to the validation layer). To enable it in release builds, pass `--gpu-assisted` (also accepted: `--gpu_assisted`, `--vgav`) together with `--validation`.
+- The flag is wired through `src/main.rs` → `App::new` → `VulkanContext::new` → `create_instance` in `src/vulkan/context.rs`, where it enables `VK_VALIDATION_FEATURE_ENABLE_GPU_ASSISTED_EXT` plus `GPU_ASSISTED_RESERVE_BINDING_SLOT` on the instance.
+- A clean shutdown must produce no validation errors in either build profile.
+
+### Verification
+
+- Verify that at least one frame renders successfully before concluding the program works.
+- For timed runs: count seconds starting after the first successful frame. Run for at least 16 seconds before stopping. Longer runs improve confidence.
+- The following asset directories must exist at runtime — the program will fail without them:
+  - `assets/models/DamagedHelmet/` — glTF model and PBR textures, loaded at startup via `load_gltf`
+  - `assets/environment_map/ennis/` — KTX2 cubemaps for IBL, loaded by `IblResources::load` (see `ENV_BASE_PATH` in `src/vulkan/renderer.rs`)
 
 ## Architecture
 
@@ -204,6 +219,4 @@ Procedural mesh helpers:
     - `BlurPushConstants.params.w` — declared dead
     - `GpuMaterial.emissive_factor.w` — **structural std140 alignment pad for the `vec3` `emissive_factor.rgb`**, NEVER pack here
 
-## Build, Run & Debug
-- Must at least capture a frame of successfully rendered window to verify the program is running correctly.
-- If the timed running must be done. The counting seconds must start at least one frame rendered successfully. Then at least 16 seconds must pass before stop the program. If you want to ensure the program running, longer running is good.
+
