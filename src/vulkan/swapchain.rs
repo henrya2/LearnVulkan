@@ -1,6 +1,5 @@
 use ash::vk;
 
-use crate::vulkan::context::VulkanContext;
 use crate::vulkan::memory::{MemoryAllocator, OwnedImage};
 
 pub struct SwapchainData {
@@ -69,7 +68,10 @@ pub fn find_depth_format(
 }
 
 pub fn create_swapchain(
-    ctx: &mut VulkanContext,
+    device: &ash::Device,
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    allocator: &mut MemoryAllocator,
     surface_loader: &ash::khr::surface::Instance,
     swapchain_loader: &ash::khr::swapchain::Device,
     surface: vk::SurfaceKHR,
@@ -78,9 +80,6 @@ pub fn create_swapchain(
     composite_render_pass: vk::RenderPass,
     surface_format: vk::SurfaceFormatKHR,
 ) -> SwapchainData {
-    let device = &ctx.device;
-    let physical_device = ctx.physical_device;
-
     let caps = unsafe {
         surface_loader
             .get_physical_device_surface_capabilities(physical_device, surface)
@@ -155,7 +154,7 @@ pub fn create_swapchain(
         })
         .collect();
 
-    let depth_format = find_depth_format(&ctx.instance, physical_device);
+    let depth_format = find_depth_format(instance, physical_device);
 
     let depth_info = vk::ImageCreateInfo::default()
         .image_type(vk::ImageType::TYPE_2D)
@@ -174,8 +173,7 @@ pub fn create_swapchain(
         .samples(vk::SampleCountFlags::TYPE_1);
     // Depth is recreated on every swapchain resize — use a dedicated block
     // so resize churn does not perturb the sub-allocator pool.
-    let depth = ctx
-        .allocator
+    let depth = allocator
         .create_dedicated_image(device, "SwapchainDepth", &depth_info);
 
     let depth_view = {

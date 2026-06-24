@@ -39,15 +39,13 @@ use glam::{Mat4, Vec4};
 /// |        |       |                  .z = .w = reserved)             |
 /// | total  | 176   | std140 block rounds up to 176 B                  |
 ///
-/// **Why the block is 176 B but the struct is 160 B:** std140 rounds
-/// the **block** up to a multiple of 16 (GLSL 4.5 §7.6.2.2), so a
-/// 160 B struct is followed by 16 B of dead space that the GPU never
-/// reads. On the CPU side we let `#[repr(C)]` round the **struct** up
-/// to its own align (16) automatically, which is also 176 B because
-/// 10 × 16 = 176. There is no `_pad` field: the trailing
-/// `lighting_pack` already provides 16 B of "struct round-up" and
-/// the std140 block round-up beyond that is the same 16 B — they
-/// coincide at 176 B without any padding work.
+/// **Block size:** 176 B = 11 × 16. The trailing `lighting_pack: Vec4`
+/// brings the struct to exactly 176 B — the same size the std140 block
+/// occupies — without any `_pad` fields. The `#[repr(C)]` layout of
+/// 2 × Mat4 + 3 × Vec4 produces a 176 B struct whose byte address of
+/// every field matches its std140 offset. No manual padding is needed.
+/// The descriptor `range` and UBO buffer size are both 176 B
+/// (`GLOBAL_UBO_BLOCK_SIZE`).
 ///
 /// The descriptor `range` and the UBO buffer size are both 176 B
 /// (`GLOBAL_UBO_BLOCK_SIZE`).

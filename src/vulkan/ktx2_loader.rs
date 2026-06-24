@@ -19,6 +19,11 @@ pub fn load_ktx2_cubemap(
         .unwrap_or_else(|e| panic!("Failed to parse KTX2 file '{}': {:?}", path, e));
     let header = reader.header();
 
+    assert!(
+        header.supercompression_scheme.is_none(),
+        "KTX2 supercompression not supported"
+    );
+
     assert_eq!(
         header.face_count, 6,
         "KTX2 file must be a cubemap (6 faces), got {}",
@@ -87,6 +92,12 @@ pub fn load_ktx2_cubemap(
         let level_size = size >> level_idx;
         let face_size_bytes = (level_size * level_size) as u64 * bytes_per_pixel as u64;
         let level_data = *level;
+        assert!(
+            level_data.len() as u64 >= 6 * face_size_bytes,
+            "KTX2 level data truncated: expected at least {} bytes, got {}",
+            6 * face_size_bytes,
+            level_data.len()
+        );
 
         // Create staging buffer for the entire level.
         let mut staging = ctx.allocator.create_buffer(

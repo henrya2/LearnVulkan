@@ -92,20 +92,14 @@ impl Renderer {
         let composite_render_pass =
             create_composite_render_pass(&ctx.device, surface_format.format);
 
-        // create_swapchain takes `&mut VulkanContext` for allocator access,
-        // but also needs `&ctx.surface_loader` and `ctx.surface`. Use raw
-        // pointers to bypass the borrow checker (the surface_loader and
-        // surface are read-only during the call, and the allocator is the
-        // only mutable thing that changes).
-        let ctx_ptr: *mut VulkanContext = ctx as *mut VulkanContext;
-        let surface_loader_ptr: *const ash::khr::surface::Instance =
-            &ctx.surface_loader as *const _;
-        let surface_handle: vk::SurfaceKHR = ctx.surface;
         let swapchain = create_swapchain(
-            unsafe { &mut *ctx_ptr },
-            unsafe { &*surface_loader_ptr },
+            &ctx.device,
+            &ctx.instance,
+            ctx.physical_device,
+            &mut ctx.allocator,
+            &ctx.surface_loader,
             &swapchain_loader,
-            surface_handle,
+            ctx.surface,
             window_width,
             window_height,
             composite_render_pass,
@@ -660,7 +654,7 @@ impl Renderer {
         let mut globals = GlobalUniforms {
             view: view,
             proj: proj,
-            camera_pos: glam::Vec4::new(camera_pos.x, camera_pos.y, camera_pos.z, 1.0),
+            camera_pos: glam::Vec4::new(camera_pos.x, camera_pos.y, camera_pos.z, 0.0),
             light_dir: glam::Vec4::new(light_dir.x, light_dir.y, light_dir.z, 0.0),
             lighting_pack: glam::Vec4::ZERO,
         };
@@ -751,6 +745,17 @@ impl Renderer {
     fn recreate_swapchain(&mut self, ctx: &mut VulkanContext) {
         unsafe { ctx.device.device_wait_idle().unwrap() };
 
+        // Guard against zero-extent surface (window minimized). The swapchain
+        // cannot be recreated until the window is restored.
+        let caps = unsafe {
+            ctx.surface_loader
+                .get_physical_device_surface_capabilities(ctx.physical_device, ctx.surface)
+                .unwrap()
+        };
+        if caps.current_extent.width == 0 || caps.current_extent.height == 0 {
+            return;
+        }
+
         // cleanup_swapchain needs &ctx.device and &mut ctx.allocator. Both
         // are sub-borrows of `ctx`; the borrow checker handles disjoint
         // field borrows here because `&mut self` and `&mut ctx` are
@@ -770,15 +775,14 @@ impl Renderer {
             format: self.swapchain.image_format,
             color_space: self.swapchain.image_color_space,
         };
-        let ctx_ptr: *mut VulkanContext = ctx as *mut VulkanContext;
-        let surface_loader_ptr: *const ash::khr::surface::Instance =
-            &ctx.surface_loader as *const _;
-        let surface_handle: vk::SurfaceKHR = ctx.surface;
         let swapchain = create_swapchain(
-            unsafe { &mut *ctx_ptr },
-            unsafe { &*surface_loader_ptr },
+            &ctx.device,
+            &ctx.instance,
+            ctx.physical_device,
+            &mut ctx.allocator,
+            &ctx.surface_loader,
             &swapchain_loader,
-            surface_handle,
+            ctx.surface,
             self.swapchain.extent.width,
             self.swapchain.extent.height,
             self.composite_render_pass,
@@ -1226,6 +1230,7 @@ fn record_command_buffer(
             command_buffer,
             postprocess,
             image_index as usize,
+            frame,           // bloom_index
             frame,
             extent,
         );
@@ -1242,6 +1247,7 @@ fn record_command_buffer(
             debug_marker,
             command_buffer,
             postprocess,
+            frame,           // bloom_index
             frame,
             extent,
         );
@@ -1288,13 +1294,14 @@ unsafe fn record_bright_pass(
     command_buffer: vk::CommandBuffer,
     postprocess: &PostProcessResources,
     image_index: usize,
+    bloom_index: usize,
     frame: usize,
     _extent: vk::Extent2D,
 ) {
     let (mip_w, mip_h) = BloomPyramid::mip_extent(postprocess.bloom_extent.0, postprocess.bloom_extent.1, 0);
     let pass_begin = vk::RenderPassBeginInfo::default()
         .render_pass(postprocess.postprocess_color_pass)
-        .framebuffer(postprocess.bright_mip0_framebuffer)
+        .framebuffer(postprocess.bright_mip0_framebuffers[bloom_index])
         .render_area(vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent: vk::Extent2D {
@@ -1341,6 +1348,7 @@ unsafe fn record_blur_passes(
     debug_marker: &DebugMarker,
     command_buffer: vk::CommandBuffer,
     postprocess: &PostProcessResources,
+    bloom_index: usize,
     frame: usize,
     _extent: vk::Extent2D,
 ) {
@@ -1361,8 +1369,8 @@ unsafe fn record_blur_passes(
             extent: mip_extent,
         };
 
-        // ---- Horizontal: read from mip[level], write to temp[level]. ----
-        // Use blur_input_sets[2*level] which is pre-bound to mip[level].
+        // ---- Horizontal: read from bloom[bloom_index].mip_views[level],
+        //      write to bloom[bloom_index].temp_views[level]. ----
         { let dm = debug_marker;
             dm.insert_label(
                 command_buffer,
@@ -1372,7 +1380,7 @@ unsafe fn record_blur_passes(
         }
         let pass_begin = vk::RenderPassBeginInfo::default()
             .render_pass(postprocess.postprocess_color_pass)
-            .framebuffer(postprocess.blur_temp_framebuffers[level])
+            .framebuffer(postprocess.blur_temp_framebuffers[bloom_index][level])
             .render_area(render_area);
         unsafe {
             device.cmd_begin_render_pass(command_buffer, &pass_begin, vk::SubpassContents::INLINE);
@@ -1383,7 +1391,7 @@ unsafe fn record_blur_passes(
                 blur_pipeline.pipeline,
             );
             let sets: [vk::DescriptorSet; 2] = [
-                postprocess.blur_input_sets[2 * level],
+                postprocess.blur_input_sets[bloom_index][2 * level],
                 postprocess.ubo_sets[frame],
             ];
             device.cmd_bind_descriptor_sets(
@@ -1411,8 +1419,8 @@ unsafe fn record_blur_passes(
             device.cmd_end_render_pass(command_buffer);
         }
 
-        // ---- Vertical: read from temp[level], write to mip[level]. ----
-        // Use blur_input_sets[2*level+1] which is pre-bound to temp[level].
+        // ---- Vertical: read from bloom[bloom_index].temp_views[level],
+        //      write to bloom[bloom_index].mip_views[level]. ----
         { let dm = debug_marker;
             dm.insert_label(
                 command_buffer,
@@ -1422,7 +1430,7 @@ unsafe fn record_blur_passes(
         }
         let pass_begin2 = vk::RenderPassBeginInfo::default()
             .render_pass(postprocess.postprocess_color_pass)
-            .framebuffer(postprocess.blur_mip_framebuffers[level])
+            .framebuffer(postprocess.blur_mip_framebuffers[bloom_index][level])
             .render_area(render_area);
         unsafe {
             device.cmd_begin_render_pass(command_buffer, &pass_begin2, vk::SubpassContents::INLINE);
@@ -1433,7 +1441,7 @@ unsafe fn record_blur_passes(
                 blur_pipeline.pipeline,
             );
             let sets2: [vk::DescriptorSet; 2] = [
-                postprocess.blur_input_sets[2 * level + 1],
+                postprocess.blur_input_sets[bloom_index][2 * level + 1],
                 postprocess.ubo_sets[frame],
             ];
             device.cmd_bind_descriptor_sets(
@@ -1500,7 +1508,7 @@ unsafe fn record_composite_pass(
             composite_pipeline.pipeline,
         );
         let sets: [vk::DescriptorSet; 2] = [
-            postprocess.composite_input_sets[image_index],
+            postprocess.composite_input_sets[frame][image_index],
             postprocess.ubo_sets[frame],
         ];
         device.cmd_bind_descriptor_sets(

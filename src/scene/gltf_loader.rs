@@ -282,7 +282,7 @@ fn decode_image(image: &gltf::image::Data) -> DecodedImage {
         gltf::image::Format::R8G8 => image
             .pixels
             .chunks_exact(2)
-            .flat_map(|chunk| [chunk[0], chunk[0], chunk[0], chunk[1]])
+            .flat_map(|chunk| [0, chunk[1], chunk[0], 255]) // ORM: R→B (metallic), G→G (roughness)
             .collect(),
         gltf::image::Format::R8G8B8 => image
             .pixels

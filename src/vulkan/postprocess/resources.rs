@@ -103,12 +103,14 @@ pub struct PostProcessResources {
     // Pre-allocated framebuffers for the postprocess passes. These reference
     // bloom mip and temp images, and are created once at startup so the
     // command buffer recording doesn't need to create/destroy them per frame.
-    pub bright_mip0_framebuffer: vk::Framebuffer,        // writes bloom mip 0
-    pub blur_temp_framebuffers: Vec<vk::Framebuffer>,    // per mip, writes temp[level]
-    pub blur_mip_framebuffers: Vec<vk::Framebuffer>,      // per mip, writes mip[level]
+    // Per-frame-in-flight to avoid cross-frame bloom read-write hazards.
+    pub bright_mip0_framebuffers: Vec<vk::Framebuffer>,         // per-frame, writes bloom mip 0
+    pub blur_temp_framebuffers: Vec<Vec<vk::Framebuffer>>,     // per-frame x per-mip, writes temp[level]
+    pub blur_mip_framebuffers: Vec<Vec<vk::Framebuffer>>,       // per-frame x per-mip, writes mip[level]
 
-    // Bloom pyramid (stable across swapchain recreation if extent unchanged)
-    pub bloom: Option<BloomPyramid>,
+    // Bloom pyramid — one per frame-in-flight to eliminate cross-frame
+    // read-write hazards on the bloom mip/temp images.
+    pub bloom: Vec<BloomPyramid>,
     pub bloom_extent: (u32, u32),
 
     // Descriptor layouts
@@ -131,9 +133,9 @@ pub struct PostProcessResources {
     pub ubo: Vec<OwnedBuffer>,
     pub ubo_mapped: Vec<*mut u8>,
     pub ubo_sets: Vec<vk::DescriptorSet>,            // per-frame-in-flight
-    pub bright_input_sets: Vec<vk::DescriptorSet>,   // per swapchain image
-    pub blur_input_sets: Vec<vk::DescriptorSet>,     // per mip
-    pub composite_input_sets: Vec<vk::DescriptorSet>, // per swapchain image
+    pub bright_input_sets: Vec<vk::DescriptorSet>,   // per swapchain image (binds scene_color only, no bloom dependency)
+    pub blur_input_sets: Vec<Vec<vk::DescriptorSet>>, // per-frame-in-flight x per-mip (binds bloom views)
+    pub composite_input_sets: Vec<Vec<vk::DescriptorSet>>, // per-frame-in-flight x per-swapchain-image (binds scene_color + bloom mips)
 
     // Sizes for re-allocation
     pub num_swapchain_images: usize,
@@ -230,105 +232,118 @@ impl PostProcessResources {
             scene_framebuffers.push(fb);
         }
 
-        // --- Bloom pyramid ---
+        // --- Bloom pyramid (one per frame-in-flight) ---
         let bloom_extent = (swapchain_extent.width, swapchain_extent.height);
-        let bloom = Some(BloomPyramid::new(
-            ctx,
-            swapchain_extent.width,
-            swapchain_extent.height,
-        ));
+        let mut blooms = Vec::with_capacity(max_frames_in_flight);
+        for _f in 0..max_frames_in_flight {
+            blooms.push(BloomPyramid::new(
+                ctx,
+                swapchain_extent.width,
+                swapchain_extent.height,
+            ));
+        }
 
-        // --- Pre-initialize all bloom mip + temp images to SHADER_READ_ONLY_OPTIMAL ---
-        // Two single-image barriers (one per pyramid image) cover all mip levels
-        // via level_count = BLOOM_MIP_COUNT. Previously this was 16 per-image
-        // barriers. This is safer because the single-image approach means every
-        // level is covered by a single transition — no possibility of a missing
-        // mip level causing a DEVICE_LOST read from UNDEFINED.
-        let bloom_ref = bloom.as_ref().unwrap();
-        let init_barriers = [
-            vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(bloom_ref.mip_image())
-                .subresource_range(vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: BLOOM_MIP_COUNT as u32,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                })
-                .src_access_mask(vk::AccessFlags::empty())
-                .dst_access_mask(vk::AccessFlags::SHADER_READ),
-            vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(bloom_ref.temp_image())
-                .subresource_range(vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: BLOOM_MIP_COUNT as u32,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                })
-                .src_access_mask(vk::AccessFlags::empty())
-                .dst_access_mask(vk::AccessFlags::SHADER_READ),
-        ];
-        crate::vulkan::buffer::with_one_time_command(ctx, command_pool, |cmd| unsafe {
-            ctx.device.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::FRAGMENT_SHADER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &init_barriers,
-            );
-        });
+        // Per-pyramid init: transition all bloom mip + temp images to
+        // SHADER_READ_ONLY_OPTIMAL. Two single-image barriers per pyramid
+        // cover all mip levels via level_count = BLOOM_MIP_COUNT.
+        {
+            let mut all_barriers: Vec<vk::ImageMemoryBarrier> =
+                Vec::with_capacity(blooms.len() * 2);
+            for bloom in blooms.iter() {
+                all_barriers.push(
+                    vk::ImageMemoryBarrier::default()
+                        .old_layout(vk::ImageLayout::UNDEFINED)
+                        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .image(bloom.mip_image())
+                        .subresource_range(vk::ImageSubresourceRange {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            base_mip_level: 0,
+                            level_count: BLOOM_MIP_COUNT as u32,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        })
+                        .src_access_mask(vk::AccessFlags::empty())
+                        .dst_access_mask(vk::AccessFlags::SHADER_READ),
+                );
+                all_barriers.push(
+                    vk::ImageMemoryBarrier::default()
+                        .old_layout(vk::ImageLayout::UNDEFINED)
+                        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .image(bloom.temp_image())
+                        .subresource_range(vk::ImageSubresourceRange {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            base_mip_level: 0,
+                            level_count: BLOOM_MIP_COUNT as u32,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        })
+                        .src_access_mask(vk::AccessFlags::empty())
+                        .dst_access_mask(vk::AccessFlags::SHADER_READ),
+                );
+            }
+            crate::vulkan::buffer::with_one_time_command(ctx, command_pool, |cmd| unsafe {
+                ctx.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &all_barriers,
+                );
+            });
+        }
 
         // --- Pre-allocate framebuffers for bright + blur passes ---
-        // These reference bloom mip and temp images, so they must be
-        // allocated after the pyramid. Creating them once at startup avoids
-        // per-frame create/destroy, which can be a use-after-free hazard if
-        // the command buffer is still in flight at destroy time, and is
-        // wasteful anyway.
+        // Per-frame-in-flight so each frame's recording uses its own bloom
+        // pyramid without cross-frame hazards.
         let (mip0_w, mip0_h) = BloomPyramid::mip_extent(bloom_extent.0, bloom_extent.1, 0);
-        let bright_mip0_framebuffer = {
-            let attachments = [bloom.as_ref().unwrap().mip_views[0]];
-            let info = vk::FramebufferCreateInfo::default()
-                .render_pass(postprocess_color_pass)
-                .attachments(&attachments)
-                .width(mip0_w)
-                .height(mip0_h)
-                .layers(1);
-            unsafe { ctx.device.create_framebuffer(&info, None).unwrap() }
-        };
-        let mut blur_temp_framebuffers = Vec::with_capacity(BLOOM_MIP_COUNT);
-        let mut blur_mip_framebuffers = Vec::with_capacity(BLOOM_MIP_COUNT);
-        for level in 0..BLOOM_MIP_COUNT {
-            let (w, h) = BloomPyramid::mip_extent(bloom_extent.0, bloom_extent.1, level);
-            let temp_attachments = [bloom.as_ref().unwrap().temp_views[level]];
-            let temp_info = vk::FramebufferCreateInfo::default()
-                .render_pass(postprocess_color_pass)
-                .attachments(&temp_attachments)
-                .width(w)
-                .height(h)
-                .layers(1);
-            let temp_fb = unsafe { ctx.device.create_framebuffer(&temp_info, None).unwrap() };
-            blur_temp_framebuffers.push(temp_fb);
+        let mut bright_mip0_framebuffers = Vec::with_capacity(max_frames_in_flight);
+        let mut all_blur_temp = Vec::with_capacity(max_frames_in_flight);
+        let mut all_blur_mip = Vec::with_capacity(max_frames_in_flight);
+        for bloom in blooms.iter() {
+            let bright_fb = {
+                let attachments = [bloom.mip_views[0]];
+                let info = vk::FramebufferCreateInfo::default()
+                    .render_pass(postprocess_color_pass)
+                    .attachments(&attachments)
+                    .width(mip0_w)
+                    .height(mip0_h)
+                    .layers(1);
+                unsafe { ctx.device.create_framebuffer(&info, None).unwrap() }
+            };
+            bright_mip0_framebuffers.push(bright_fb);
 
-            let mip_attachments = [bloom.as_ref().unwrap().mip_views[level]];
-            let mip_info = vk::FramebufferCreateInfo::default()
-                .render_pass(postprocess_color_pass)
-                .attachments(&mip_attachments)
-                .width(w)
-                .height(h)
-                .layers(1);
-            let mip_fb = unsafe { ctx.device.create_framebuffer(&mip_info, None).unwrap() };
-            blur_mip_framebuffers.push(mip_fb);
+            let mut blur_temp = Vec::with_capacity(BLOOM_MIP_COUNT);
+            let mut blur_mip = Vec::with_capacity(BLOOM_MIP_COUNT);
+            for level in 0..BLOOM_MIP_COUNT {
+                let (w, h) = BloomPyramid::mip_extent(bloom_extent.0, bloom_extent.1, level);
+                let temp_attachments = [bloom.temp_views[level]];
+                let temp_info = vk::FramebufferCreateInfo::default()
+                    .render_pass(postprocess_color_pass)
+                    .attachments(&temp_attachments)
+                    .width(w)
+                    .height(h)
+                    .layers(1);
+                let temp_fb = unsafe { ctx.device.create_framebuffer(&temp_info, None).unwrap() };
+                blur_temp.push(temp_fb);
+
+                let mip_attachments = [bloom.mip_views[level]];
+                let mip_info = vk::FramebufferCreateInfo::default()
+                    .render_pass(postprocess_color_pass)
+                    .attachments(&mip_attachments)
+                    .width(w)
+                    .height(h)
+                    .layers(1);
+                let mip_fb = unsafe { ctx.device.create_framebuffer(&mip_info, None).unwrap() };
+                blur_mip.push(mip_fb);
+            }
+            all_blur_temp.push(blur_temp);
+            all_blur_mip.push(blur_mip);
         }
 
         // --- Descriptor layouts ---
@@ -403,8 +418,12 @@ impl PostProcessResources {
 
         // --- Descriptor pool ---
         let ubo_count = max_frames_in_flight as u32;
+        let frames_in_flight = max_frames_in_flight;
         let sampler_count =
-            (num_swapchain_images + BLOOM_MIP_COUNT * 2 + num_swapchain_images * 9) as u32;
+            (num_swapchain_images                           // bright: one per swapchain image
+                + frames_in_flight * BLOOM_MIP_COUNT * 2  // blur: per-frame x per-mip x 2 dir
+                + frames_in_flight * num_swapchain_images * 9 // composite: per-frame x per-image x 9 bindings
+            ) as u32;
         let pool_sizes = [
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::UNIFORM_BUFFER,
@@ -418,11 +437,12 @@ impl PostProcessResources {
         // Total sets:
         //   - ubo_count UBO sets (per frame in flight)
         //   - num_swapchain_images bright-input sets
-        //   - BLOOM_MIP_COUNT * 2 blur-input sets (one per mip per direction)
-        //   - num_swapchain_images composite-input sets
+        //   - frames_in_flight * BLOOM_MIP_COUNT * 2 blur-input sets
+        //   - frames_in_flight * num_swapchain_images composite-input sets
         let total_sets = ubo_count
-            + 2 * num_swapchain_images as u32
-            + 2 * BLOOM_MIP_COUNT as u32;
+            + num_swapchain_images as u32
+            + (frames_in_flight * 2 * BLOOM_MIP_COUNT) as u32
+            + (frames_in_flight * num_swapchain_images) as u32;
         let pool_info = vk::DescriptorPoolCreateInfo::default()
             .pool_sizes(&pool_sizes)
             .max_sets(total_sets);
@@ -477,11 +497,11 @@ impl PostProcessResources {
             scene_allocations,
             scene_views,
             scene_framebuffers,
-            bloom,
+            bloom: blooms,
             bloom_extent,
-            bright_mip0_framebuffer,
-            blur_temp_framebuffers,
-            blur_mip_framebuffers,
+            bright_mip0_framebuffers,
+            blur_temp_framebuffers: all_blur_temp,
+            blur_mip_framebuffers: all_blur_mip,
             ubo_layout,
             single_input_layout,
             composite_input_layout,
@@ -513,9 +533,9 @@ impl PostProcessResources {
     /// re-allocate the UBO sets and call this.
     fn allocate_input_sets(&mut self, ctx: &mut VulkanContext) {
         let device = &ctx.device;
-        let bloom = self.bloom.as_ref().expect("bloom must exist");
-        let bloom_sampler = bloom.sampler;
+        let bloom_sampler = self.bloom[0].sampler; // all blooms share the same sampler config
         // Bright input sets: one per swapchain image, sample scene color.
+        // No bloom dependency, so stay per-swapchain-image.
         let layouts = vec![self.single_input_layout; self.num_swapchain_images];
         let alloc = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.descriptor_pool)
@@ -535,79 +555,89 @@ impl PostProcessResources {
             unsafe { device.update_descriptor_sets(std::slice::from_ref(&write), &[]) };
         }
 
-        // Blur input sets: TWO per mip (horizontal reads mip[i], vertical reads
-        // temp[i]). 16 sets total. Each is bound to the same pipeline slot
-        // but holds a different image, avoiding the need to update descriptor
-        // sets mid-recording.
-        // Layout: index 2*i     = horizontal (samples mip[i])
-        //         index 2*i + 1 = vertical   (samples temp[i])
-        let layouts = vec![self.single_input_layout; BLOOM_MIP_COUNT * 2];
-        let alloc = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.descriptor_pool)
-            .set_layouts(&layouts);
-        self.blur_input_sets = unsafe { device.allocate_descriptor_sets(&alloc).unwrap() };
-        for i in 0..BLOOM_MIP_COUNT {
-            // Horizontal: samples mip[i]
-            let img_h = vk::DescriptorImageInfo::default()
-                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .image_view(bloom.mip_views[i])
-                .sampler(bloom_sampler);
-            let write_h = vk::WriteDescriptorSet::default()
-                .dst_set(self.blur_input_sets[2 * i])
-                .dst_binding(0)
-                .dst_array_element(0)
-                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .image_info(std::slice::from_ref(&img_h));
-            unsafe { device.update_descriptor_sets(std::slice::from_ref(&write_h), &[]) };
-            // Vertical: samples temp[i]
-            let img_v = vk::DescriptorImageInfo::default()
-                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .image_view(bloom.temp_views[i])
-                .sampler(bloom_sampler);
-            let write_v = vk::WriteDescriptorSet::default()
-                .dst_set(self.blur_input_sets[2 * i + 1])
-                .dst_binding(0)
-                .dst_array_element(0)
-                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .image_info(std::slice::from_ref(&img_v));
-            unsafe { device.update_descriptor_sets(std::slice::from_ref(&write_v), &[]) };
-        }
-
-        // Composite input sets: one per swapchain image. 9 bindings: 0 = scene
-        // color, 1..8 = bloom mip i-1.
-        let layouts = vec![self.composite_input_layout; self.num_swapchain_images];
-        let alloc = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.descriptor_pool)
-            .set_layouts(&layouts);
-        self.composite_input_sets = unsafe { device.allocate_descriptor_sets(&alloc).unwrap() };
-        for (i, &set) in self.composite_input_sets.iter().enumerate() {
-            let mut image_infos: Vec<vk::DescriptorImageInfo> = Vec::with_capacity(9);
-            image_infos.push(
-                vk::DescriptorImageInfo::default()
+        // Blur input sets: per-frame-in-flight x per mip.
+        // Index: blur_input_sets[frame][2*i]     = horizontal (samples bloom[frame].mip_view[i])
+        //        blur_input_sets[frame][2*i + 1] = vertical   (samples bloom[frame].temp_view[i])
+        let frames_in_flight = self.bloom.len();
+        let mut all_blur_sets: Vec<Vec<vk::DescriptorSet>> = Vec::with_capacity(frames_in_flight);
+        for f in 0..frames_in_flight {
+            let layouts = vec![self.single_input_layout; BLOOM_MIP_COUNT * 2];
+            let alloc = vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(self.descriptor_pool)
+                .set_layouts(&layouts);
+            let sets = unsafe { device.allocate_descriptor_sets(&alloc).unwrap() };
+            let bloom = &self.bloom[f];
+            for i in 0..BLOOM_MIP_COUNT {
+                // Horizontal: samples bloom[frame].mip_views[i]
+                let img_h = vk::DescriptorImageInfo::default()
                     .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                    .image_view(self.scene_views[i])
-                    .sampler(bloom_sampler),
-            );
-            for mip_view in bloom.mip_views.iter() {
+                    .image_view(bloom.mip_views[i])
+                    .sampler(bloom_sampler);
+                let write_h = vk::WriteDescriptorSet::default()
+                    .dst_set(sets[2 * i])
+                    .dst_binding(0)
+                    .dst_array_element(0)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(std::slice::from_ref(&img_h));
+                unsafe { device.update_descriptor_sets(std::slice::from_ref(&write_h), &[]) };
+                // Vertical: samples bloom[frame].temp_views[i]
+                let img_v = vk::DescriptorImageInfo::default()
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .image_view(bloom.temp_views[i])
+                    .sampler(bloom_sampler);
+                let write_v = vk::WriteDescriptorSet::default()
+                    .dst_set(sets[2 * i + 1])
+                    .dst_binding(0)
+                    .dst_array_element(0)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(std::slice::from_ref(&img_v));
+                unsafe { device.update_descriptor_sets(std::slice::from_ref(&write_v), &[]) };
+            }
+            all_blur_sets.push(sets);
+        }
+        self.blur_input_sets = all_blur_sets;
+
+        // Composite input sets: per-frame-in-flight x per-swapchain-image.
+        // 9 bindings: 0 = scene_color[i], 1..8 = bloom[frame].mip_views[*]
+        let mut all_composite_sets: Vec<Vec<vk::DescriptorSet>> = Vec::with_capacity(frames_in_flight);
+        for f in 0..frames_in_flight {
+            let layouts = vec![self.composite_input_layout; self.num_swapchain_images];
+            let alloc = vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(self.descriptor_pool)
+                .set_layouts(&layouts);
+            let sets = unsafe { device.allocate_descriptor_sets(&alloc).unwrap() };
+            let bloom = &self.bloom[f];
+            for (i, &set) in sets.iter().enumerate() {
+                let mut image_infos: Vec<vk::DescriptorImageInfo> = Vec::with_capacity(9);
                 image_infos.push(
                     vk::DescriptorImageInfo::default()
                         .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                        .image_view(*mip_view)
+                        .image_view(self.scene_views[i])
                         .sampler(bloom_sampler),
                 );
+                for mip_view in bloom.mip_views.iter() {
+                    image_infos.push(
+                        vk::DescriptorImageInfo::default()
+                            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                            .image_view(*mip_view)
+                            .sampler(bloom_sampler),
+                    );
+                }
+                let writes: Vec<vk::WriteDescriptorSet> = (0..9)
+                    .map(|b| {
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(set)
+                            .dst_binding(b)
+                            .dst_array_element(0)
+                            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                            .image_info(std::slice::from_ref(&image_infos[b as usize]))
+                    })
+                    .collect();
+                unsafe { device.update_descriptor_sets(&writes, &[]) };
             }
-            let writes: Vec<vk::WriteDescriptorSet> = (0..9)
-                .map(|b| {
-                    vk::WriteDescriptorSet::default()
-                        .dst_set(set)
-                        .dst_binding(b)
-                        .dst_array_element(0)
-                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                        .image_info(std::slice::from_ref(&image_infos[b as usize]))
-                })
-                .collect();
-            unsafe { device.update_descriptor_sets(&writes, &[]) };
+            all_composite_sets.push(sets);
         }
+        self.composite_input_sets = all_composite_sets;
         let _ = ctx;
     }
 
@@ -655,26 +685,32 @@ impl PostProcessResources {
                 );
             }
 
-            // Bloom sampler
-            if let Some(bloom) = self.bloom.as_ref() {
-                dm.set_object_name(bloom.sampler, "Bloom Sampler");
-                dm.set_object_name(bloom.mip_image(), "Bloom Mip Image");
-                dm.set_object_name(bloom.temp_image(), "Bloom Temp Image");
+            // Bloom per frame-in-flight
+            for (f, bloom) in self.bloom.iter().enumerate() {
+                dm.set_object_name(bloom.sampler, &format!("Bloom Sampler F{}", f));
+                dm.set_object_name(bloom.mip_image(), &format!("Bloom Mip Image F{}", f));
+                dm.set_object_name(bloom.temp_image(), &format!("Bloom Temp Image F{}", f));
                 for (i, &view) in bloom.mip_views.iter().enumerate() {
-                    dm.set_object_name(view, &format!("Bloom Mip View {}", i));
+                    dm.set_object_name(view, &format!("Bloom Mip View F{} Lvl {}", f, i));
                 }
                 for (i, &view) in bloom.temp_views.iter().enumerate() {
-                    dm.set_object_name(view, &format!("Bloom Temp View {}", i));
+                    dm.set_object_name(view, &format!("Bloom Temp View F{} Lvl {}", f, i));
                 }
             }
 
-            // Bloom framebuffers
-            dm.set_object_name(self.bright_mip0_framebuffer, "Bloom Prefilter Framebuffer");
-            for (i, &fb) in self.blur_temp_framebuffers.iter().enumerate() {
-                dm.set_object_name(fb, &format!("Bloom Blur Temp Framebuffer {}", i));
+            // Bloom framebuffers (per frame)
+            for (f, &fb) in self.bright_mip0_framebuffers.iter().enumerate() {
+                dm.set_object_name(fb, &format!("Bloom Prefilter Framebuffer F{}", f));
             }
-            for (i, &fb) in self.blur_mip_framebuffers.iter().enumerate() {
-                dm.set_object_name(fb, &format!("Bloom Blur Mip Framebuffer {}", i));
+            for (f, fbs) in self.blur_temp_framebuffers.iter().enumerate() {
+                for (i, &fb) in fbs.iter().enumerate() {
+                    dm.set_object_name(fb, &format!("Bloom Blur Temp Framebuffer F{} Lvl {}", f, i));
+                }
+            }
+            for (f, fbs) in self.blur_mip_framebuffers.iter().enumerate() {
+                for (i, &fb) in fbs.iter().enumerate() {
+                    dm.set_object_name(fb, &format!("Bloom Blur Mip Framebuffer F{} Lvl {}", f, i));
+                }
             }
 
             // Pipelines
@@ -722,16 +758,20 @@ impl PostProcessResources {
             for (i, &set) in self.bright_input_sets.iter().enumerate() {
                 dm.set_object_name(set, &format!("Bloom Prefilter Input Set Image {}", i));
             }
-            for (i, &set) in self.blur_input_sets.iter().enumerate() {
-                let level = i / 2;
-                let dir = if i % 2 == 0 { "H" } else { "V" };
-                dm.set_object_name(
-                    set,
-                    &format!("Bloom Blur Input Set Level {} {}", level, dir),
-                );
+            for (f, frame_sets) in self.blur_input_sets.iter().enumerate() {
+                for (i, &set) in frame_sets.iter().enumerate() {
+                    let level = i / 2;
+                    let dir = if i % 2 == 0 { "H" } else { "V" };
+                    dm.set_object_name(
+                        set,
+                        &format!("Bloom Blur Input Set F{} Lvl {} {}", f, level, dir),
+                    );
+                }
             }
-            for (i, &set) in self.composite_input_sets.iter().enumerate() {
-                dm.set_object_name(set, &format!("Composite Input Set Image {}", i));
+            for (f, frame_sets) in self.composite_input_sets.iter().enumerate() {
+                for (i, &set) in frame_sets.iter().enumerate() {
+                    dm.set_object_name(set, &format!("Composite Input Set F{} Image {}", f, i));
+                }
             }
         }
     }
@@ -792,16 +832,22 @@ impl PostProcessResources {
             // Postprocess framebuffers (bright + blur). These were pre-allocated
             // at startup; we must destroy them before destroying the bloom
             // pyramid images they reference.
-            device.destroy_framebuffer(self.bright_mip0_framebuffer, None);
-            for fb in self.blur_temp_framebuffers.drain(..) {
+            for fb in self.bright_mip0_framebuffers.drain(..) {
                 device.destroy_framebuffer(fb, None);
             }
-            for fb in self.blur_mip_framebuffers.drain(..) {
-                device.destroy_framebuffer(fb, None);
+            for mut frame_fbs in self.blur_temp_framebuffers.drain(..) {
+                for fb in frame_fbs.drain(..) {
+                    device.destroy_framebuffer(fb, None);
+                }
+            }
+            for mut frame_fbs in self.blur_mip_framebuffers.drain(..) {
+                for fb in frame_fbs.drain(..) {
+                    device.destroy_framebuffer(fb, None);
+                }
             }
 
-            // Bloom pyramid
-            if let Some(mut b) = self.bloom.take() {
+            // Bloom pyramid (per frame-in-flight)
+            for mut b in self.bloom.drain(..) {
                 b.destroy(device, allocator);
             }
         }

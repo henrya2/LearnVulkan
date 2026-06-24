@@ -31,6 +31,11 @@ pub struct BloomPyramid {
 impl BloomPyramid {
     pub fn new(ctx: &mut VulkanContext, width: u32, height: u32) -> Self {
         assert!(width > 0 && height > 0, "bloom extent must be positive");
+        assert!(
+            width.max(height) >= 128,
+            "Bloom requires resolution >= 128x128 (has {}x{}) — BLOOM_MIP_COUNT={} needs {}+ mips",
+            width, height, BLOOM_MIP_COUNT, (width.max(height) as f32).log2().ceil() as u32 + 1
+        );
 
         let sampler_info = vk::SamplerCreateInfo::default()
             .mag_filter(vk::Filter::LINEAR)

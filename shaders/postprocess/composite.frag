@@ -78,19 +78,16 @@ vec3 aces(vec3 c) {
     return clamp(c, 0.0, 1.0);
 }
 
-// Reinhard-Jodie (2015, joint Reinhard with per-channel whitepoint).
-// Reference: https://www.shadertoy.com/view/MdlXrX
-//   L_white = 4.0  (linear scene-linear luminance that maps to 1.0 in the
-//                    display; can be tuned for taste, 4.0 is the author's
-//                    default that preserves "sun-like" highlights)
-//
-// The key fix over the textbook Reinhard x/(1+x) is that compression is
-// applied to the luminance L, not to each channel independently, while the
-// per-channel ratio color / L is preserved. This stops bright colors from
-// desaturating to white — the most common "Reinhard looks washed out" issue.
+// Luminance Reinhard with per-channel color preservation.
+// This is NOT the canonical Reinhard-Jodie (which applies per-channel),
+// but a luminance-based variant: compression is applied to the luminance L
+// only, while the per-channel ratio color/L is preserved. The whitepoint
+// correction keeps bright highlights from desaturating to white.
+// L_white = 4.0 (scene-linear luminance that maps to 1.0 in the display;
+//                  tunable for taste; 4.0 preserves "sun-like" highlights)
 const float L_WHITE = 4.0;
 
-vec3 reinhardJodie(vec3 c) {
+vec3 reinhardLuminance(vec3 c) {
     float L = dot(c, vec3(0.2126, 0.7152, 0.0722)); // Rec.709 luminance
     float Lt = L / (1.0 + L);
     // Per-channel whitepoint correction: each channel tints towards
@@ -123,7 +120,7 @@ void main() {
 
     vec3 mapped;
     if (floatBitsToUint(pp.tonemapPack.x) == 1u) {
-        mapped = reinhardJodie(color);
+        mapped = reinhardLuminance(color);
     } else if (floatBitsToUint(pp.tonemapPack.x) == 2u) {
         mapped = aces(color);
     } else {
