@@ -3,9 +3,11 @@
 layout(set = 0, binding = 0) uniform GlobalUBO {
     mat4 view;
     mat4 proj;
+    mat4 invViewProj;        // used by the deferred lighting pass
     vec4 cameraPos;          // .xyz used, .w reserved (channel-reuse policy)
     vec4 lightDir;           // .xyz used, .w reserved
     vec4 lightingPack;       // .x = lightIntensity, .y = prefilterMaxLod, .z..w reserved
+    vec4 deferredPack;       // .x = floatBitsToUint(debugView), .yzw reserved
 } globals;
 
 layout(push_constant) uniform PushConstants {

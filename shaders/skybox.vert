@@ -3,9 +3,11 @@
 layout(set = 0, binding = 0) uniform GlobalUBO {
     mat4 view;
     mat4 proj;
+    mat4 invViewProj;    // used by the deferred lighting pass
     vec4 cameraPos;
     vec4 lightDir;
     vec4 lightingPack;   // .x = lightIntensity, .y = prefilterMaxLod, .z..w = 0 (dead)
+    vec4 deferredPack;   // .x = floatBitsToUint(debugView), .yzw reserved
 } globals;
 
 layout(location = 0) in vec3 inPos;

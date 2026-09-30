@@ -168,7 +168,11 @@ pub fn create_swapchain(
         .format(depth_format)
         .tiling(vk::ImageTiling::OPTIMAL)
         .initial_layout(vk::ImageLayout::UNDEFINED)
-        .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+        // SAMPLED: the deferred lighting pass reads the depth buffer to
+        // reconstruct the world-space position of each pixel.
+        .usage(
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+        )
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
         .samples(vk::SampleCountFlags::TYPE_1);
     // Depth is recreated on every swapchain resize — use a dedicated block

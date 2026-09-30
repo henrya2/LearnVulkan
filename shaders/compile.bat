@@ -6,6 +6,10 @@ glslc -g brdf_lut.vert -o brdf_lut.vert.spv
 glslc -g brdf_lut.frag -o brdf_lut.frag.spv
 glslc -g skybox.vert -o skybox.vert.spv
 glslc -g skybox.frag -o skybox.frag.spv
+rem Deferred path: gbuffer.frag pairs with pbr.vert; deferred.frag pairs with
+rem postprocess/fullscreen.vert (fullscreen triangle).
+glslc -g gbuffer.frag -o gbuffer.frag.spv
+glslc -g deferred.frag -o deferred.frag.spv
 
 pushd postprocess
 glslc -g fullscreen.vert -o fullscreen.vert.spv

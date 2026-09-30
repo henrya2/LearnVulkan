@@ -10,6 +10,7 @@ use winit::window::{CursorGrabMode, Window};
 use crate::camera::Camera;
 use crate::input::InputState;
 use crate::vulkan::context::VulkanContext;
+use crate::vulkan::deferred::DeferredDebugView;
 use crate::vulkan::postprocess::TonemapOp;
 use crate::vulkan::renderer::Renderer;
 
@@ -25,6 +26,12 @@ pub struct App {
     /// `cycle_tonemap`; on startup it is initialized to match the renderer's
     /// default (ACES, per `PostProcessSettings::default`).
     pub current_tonemap: TonemapOp,
+    /// `true` = deferred path, `false` = forward path. Mirrors
+    /// `Renderer::deferred_enabled`; toggled with the `F` key.
+    pub deferred_enabled: bool,
+    /// G-buffer visualisation mode of the deferred lighting pass. Mirrors
+    /// `Renderer::debug_view`; cycled with the `G` key.
+    pub debug_view: DeferredDebugView,
 }
 
 impl Drop for App {
@@ -72,12 +79,16 @@ impl App {
         let renderer = Renderer::new(&mut ctx, size.width, size.height);
 
         let current_tonemap = TonemapOp::Aces;
-        // Set the initial window title from the tonemap we just initialised
-        // the renderer with. The constructor in `main.rs` only knows a
-        // static string; the actual tonemap defaults live in
-        // `PostProcessSettings::default`, so the title must be applied
-        // here (after both are constructed) to stay in sync.
-        let title = format_title(current_tonemap);
+        // The renderer owns the canonical path / debug-view defaults; read
+        // them back so the App mirrors the renderer instead of hardcoding a
+        // second copy.
+        let deferred_enabled = renderer.deferred_enabled;
+        let debug_view = renderer.debug_view;
+        // Set the initial window title from the state we just initialised.
+        // The constructor in `main.rs` only knows a static string; the actual
+        // defaults live in the renderer, so the title must be applied here
+        // (after both are constructed) to stay in sync.
+        let title = format_title(deferred_enabled, debug_view, current_tonemap);
         window.set_title(&title);
 
         Self {
@@ -89,6 +100,8 @@ impl App {
             mouse_locked: false,
             last_frame: Instant::now(),
             current_tonemap,
+            deferred_enabled,
+            debug_view,
         }
     }
 
@@ -129,6 +142,16 @@ impl App {
                     self.cycle_tonemap();
                 }
             }
+            PhysicalKey::Code(KeyCode::KeyF) => {
+                if pressed {
+                    self.toggle_render_path();
+                }
+            }
+            PhysicalKey::Code(KeyCode::KeyG) => {
+                if pressed {
+                    self.cycle_debug_view();
+                }
+            }
             _ => {}
         }
     }
@@ -142,9 +165,46 @@ impl App {
         let next = self.current_tonemap.next();
         self.current_tonemap = next;
         self.renderer.set_tonemap(next);
-        let title = format_title(next);
-        self.window.set_title(&title);
+        self.update_title();
         eprintln!("[tonemap] -> {}", next);
+    }
+
+    /// Switch between the deferred path (G-buffer pass + deferred lighting
+    /// pass) and the original forward path. The next `draw_frame` records the
+    /// new path; both paths write the same HDR scene-color image, so the
+    /// postprocess chain is unaffected.
+    pub fn toggle_render_path(&mut self) {
+        self.deferred_enabled = !self.deferred_enabled;
+        self.renderer.set_deferred(self.deferred_enabled);
+        self.update_title();
+        eprintln!(
+            "[path] -> {}",
+            if self.deferred_enabled {
+                "Deferred"
+            } else {
+                "Forward"
+            }
+        );
+    }
+
+    /// Advance the deferred lighting pass's G-buffer visualisation mode
+    /// Shaded -> Albedo -> Normal -> Roughness -> Metallic -> AO -> Depth.
+    /// The mode travels in the global UBO, which is rewritten every frame, so
+    /// it takes effect on the next `draw_frame`. It has no effect while the
+    /// forward path is active (no G-buffer exists then).
+    pub fn cycle_debug_view(&mut self) {
+        let next = self.debug_view.next();
+        self.debug_view = next;
+        self.renderer.set_debug_view(next);
+        self.update_title();
+        eprintln!("[gbuffer] -> {}", next);
+    }
+
+    /// Rebuild the window title from the current state. Defined once so the
+    /// format cannot drift between the startup path and the keybindings.
+    fn update_title(&self) {
+        let title = format_title(self.deferred_enabled, self.debug_view, self.current_tonemap);
+        self.window.set_title(&title);
     }
 
     pub fn on_mouse_button(&mut self, button: MouseButton, state: ElementState) {
@@ -230,9 +290,23 @@ impl App {
     }
 }
 
-/// Build the user-facing window title. Format: "LearnVulkan - Tonemap: <OP>".
-/// Used both at startup and on every tonemap switch (T key). Kept as a free
-/// function so the format is defined in exactly one place.
-fn format_title(op: TonemapOp) -> String {
-    format!("LearnVulkan - Tonemap: {}", op)
+/// Build the user-facing window title.
+///
+/// Format: `LearnVulkan - <Path> - Tonemap: <OP>`, with `- View: <VIEW>`
+/// inserted after the path when a G-buffer debug view is active (and the
+/// deferred path is the one running). Used at startup and on every `T` / `F` /
+/// `G` keypress. Kept as a free function so the format is defined in exactly
+/// one place.
+fn format_title(deferred: bool, view: DeferredDebugView, op: TonemapOp) -> String {
+    let path = if deferred { "Deferred" } else { "Forward" };
+    match view {
+        DeferredDebugView::Shaded => format!("LearnVulkan - {} - Tonemap: {}", path, op),
+        // Debug views are produced by the deferred lighting pass only, so
+        // they are not advertised while the forward path is selected.
+        _ if deferred => format!(
+            "LearnVulkan - {} - View: {} - Tonemap: {}",
+            path, view, op
+        ),
+        _ => format!("LearnVulkan - {} - Tonemap: {}", path, op),
+    }
 }

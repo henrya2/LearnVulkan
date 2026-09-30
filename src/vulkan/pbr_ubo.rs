@@ -24,36 +24,44 @@ use glam::{Mat4, Vec4};
 /// zero) and are explicitly reserved for future scalars (see the
 /// free-slot inventory in `CODEBUDDY.md`).
 ///
-/// std140 layout (struct size = 176 B = 11 × 16, GPU block size = 176 B):
+/// std140 layout (struct size = 256 B = 16 × 16, GPU block size = 256 B):
 ///
 /// | Offset | Bytes | Field                                            |
 /// |--------|-------|--------------------------------------------------|
 /// | 0      | 64    | `view`            (mat4)                         |
 /// | 64     | 64    | `proj`            (mat4)                         |
-/// | 128    | 16    | `camera_pos`      (vec4 — shader reads .xyz;     |
+/// | 128    | 64    | `inv_view_proj`   (mat4)                         |
+/// | 192    | 16    | `camera_pos`      (vec4 — shader reads .xyz;     |
 /// |        |       |                  .w reserved, see policy)        |
-/// | 144    | 16    | `light_dir`       (vec4 — shader reads .xyz;     |
+/// | 208    | 16    | `light_dir`       (vec4 — shader reads .xyz;     |
 /// |        |       |                  .w reserved, see policy)        |
-/// | 160    | 16    | `lighting_pack`   (vec4 — .x = light_intensity,  |
+/// | 224    | 16    | `lighting_pack`   (vec4 — .x = light_intensity,  |
 /// |        |       |                  .y = prefilter_max_lod,         |
 /// |        |       |                  .z = .w = reserved)             |
-/// | total  | 176   | std140 block rounds up to 176 B                  |
+/// | 240    | 16    | `deferred_pack`   (vec4 — .x = debug_view,       |
+/// |        |       |                  .yzw = reserved)                |
+/// | total  | 256   | std140 block rounds up to 256 B                  |
 ///
-/// **Block size:** 176 B = 11 × 16. The trailing `lighting_pack: Vec4`
-/// brings the struct to exactly 176 B — the same size the std140 block
+/// **Block size:** 256 B = 16 × 16. The trailing `deferred_pack: Vec4`
+/// brings the struct to exactly 256 B — the same size the std140 block
 /// occupies — without any `_pad` fields. The `#[repr(C)]` layout of
-/// 2 × Mat4 + 3 × Vec4 produces a 176 B struct whose byte address of
+/// 3 × Mat4 + 4 × Vec4 produces a 256 B struct whose byte address of
 /// every field matches its std140 offset. No manual padding is needed.
-/// The descriptor `range` and UBO buffer size are both 176 B
+/// The descriptor `range` and UBO buffer size are both 256 B
 /// (`GLOBAL_UBO_BLOCK_SIZE`).
 ///
-/// The descriptor `range` and the UBO buffer size are both 176 B
+/// The descriptor `range` and the UBO buffer size are both 256 B
 /// (`GLOBAL_UBO_BLOCK_SIZE`).
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct GlobalUniforms {
     pub view: Mat4,
     pub proj: Mat4,
+    /// Inverse of `proj * view`. The deferred lighting pass uses it to
+    /// reconstruct the world-space position of a pixel from the depth
+    /// buffer: `inv_view_proj * vec4(ndc.xy, depth, 1.0)` followed by the
+    /// perspective divide.
+    pub inv_view_proj: Mat4,
     /// Camera position in world space. The shader reads `.xyz`; `.w` is
     /// reserved per the channel-reuse policy (no current consumer).
     pub camera_pos: Vec4,
@@ -66,6 +74,12 @@ pub struct GlobalUniforms {
     /// `.z` = `.w` = reserved (always 0 on CPU; GLSL has them as
     /// reserved dead channels).
     pub lighting_pack: Vec4,
+    /// `.x` = `debug_view` (bit-packed `u32` via `f32::from_bits`) — the
+    /// G-buffer visualisation mode of the deferred lighting pass.
+    /// `0` = shaded, `1` = albedo, `2` = normal, `3` = roughness,
+    /// `4` = metallic, `5` = occlusion, `6` = linear depth.
+    /// `.y` / `.z` / `.w` = reserved (no current consumer).
+    pub deferred_pack: Vec4,
 }
 
 impl GlobalUniforms {
@@ -129,13 +143,29 @@ impl GlobalUniforms {
     pub fn light_dir_w(&self) -> f32 {
         self.light_dir.w
     }
+
+    /// G-buffer visualisation mode of the deferred lighting pass. The `u32`
+    /// is bit-packed into `deferred_pack.x`; the shader reads it back with
+    /// `floatBitsToUint(globals.deferredPack.x)`. See
+    /// [`crate::vulkan::deferred::DeferredDebugView`] for the mode values.
+    #[inline]
+    pub fn set_debug_view(&mut self, v: u32) {
+        self.deferred_pack.x = f32::from_bits(v);
+    }
+
+    /// See [`Self::set_debug_view`].
+    #[inline]
+    #[allow(dead_code)]
+    pub fn debug_view(&self) -> u32 {
+        self.deferred_pack.x.to_bits()
+    }
 }
 
-const _: () = assert!(std::mem::size_of::<GlobalUniforms>() == 176);
+const _: () = assert!(std::mem::size_of::<GlobalUniforms>() == 256);
 
-/// The CPU struct and the GPU std140 block are both 176 B. Use this for
+/// The CPU struct and the GPU std140 block are both 256 B. Use this for
 /// the descriptor `range` and the UBO buffer size.
-pub const GLOBAL_UBO_BLOCK_SIZE: u64 = 176;
+pub const GLOBAL_UBO_BLOCK_SIZE: u64 = 256;
 
 /// Push constants are tightly packed in Vulkan (Vulkan 1.3 §15.8.1)
 /// and the project applies the same Vec4-base-element rule here: the

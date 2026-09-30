@@ -6,6 +6,7 @@ use crate::scene::gltf_loader::{Scene, load_gltf};
 use crate::vulkan::buffer::create_device_local_buffer;
 use crate::vulkan::context::VulkanContext;
 use crate::vulkan::debug_marker::DebugMarker;
+use crate::vulkan::deferred::{DeferredDebugView, GBufferResources};
 use crate::vulkan::descriptors::{
     create_descriptor_pool, create_global_descriptor_set_layout,
     create_material_descriptor_set_layout,
@@ -70,6 +71,17 @@ pub struct Renderer {
     pub skybox_index_count: u32,
     /// Postprocess chain (scene color, bloom, composite).
     pub postprocess: Option<PostProcessResources>,
+    /// Deferred path resources (G-buffer images, render passes, pipelines).
+    /// `None` only between `take()` and re-creation inside
+    /// `recreate_swapchain`.
+    pub gbuffer: Option<GBufferResources>,
+    /// `true` renders through the deferred path (G-buffer pass + deferred
+    /// lighting pass), `false` renders the original forward path. Toggled at
+    /// runtime with the `F` key; deferred is the default.
+    pub deferred_enabled: bool,
+    /// G-buffer visualisation mode of the deferred lighting pass. Tracked
+    /// here (not only in the UBO) so it survives swapchain recreation.
+    pub debug_view: DeferredDebugView,
     /// Current tonemap operator. Tracked here (not only in the UBO) so it
     /// survives swapchain recreation, which rebuilds `PostProcessResources`
     /// with a default tonemap and would otherwise silently reset the user's
@@ -156,10 +168,24 @@ impl Renderer {
             global_descriptor_set_layout,
         );
 
+        // The deferred lighting pass renders into the postprocess
+        // scene-color image, so `GBufferResources` must be built after
+        // `PostProcessResources` (its lighting framebuffers reference those
+        // image views).
+        let gbuffer = GBufferResources::new(
+            ctx,
+            depth_format,
+            swapchain.depth_view,
+            swapchain.extent,
+            &postprocess.scene_views,
+            global_descriptor_set_layout,
+            material_descriptor_set_layout,
+        );
+
         let ubo_size = std::mem::size_of::<GlobalUniforms>() as vk::DeviceSize;
         // The UBO must be at least GLOBAL_UBO_BLOCK_SIZE bytes. With the
         // `Vec4`-based struct, `size_of::<GlobalUniforms>()` is already
-        // 176 (a multiple of 16), so the std140 block size equals the
+        // 256 (a multiple of 16), so the std140 block size equals the
         // struct size and `max` is a defensive guard in case a future
         // field layout changes that.
         let alloc_size = GLOBAL_UBO_BLOCK_SIZE.max(ubo_size);
@@ -421,6 +447,9 @@ impl Renderer {
             skybox_index_buffer,
             skybox_index_count,
             postprocess: Some(postprocess),
+            gbuffer: Some(gbuffer),
+            deferred_enabled: true,
+            debug_view: DeferredDebugView::Shaded,
             current_tonemap: TonemapOp::Aces, // matches PostProcessSettings::default
             composite_render_pass,
         };
@@ -447,6 +476,22 @@ impl Renderer {
         if let Some(pp) = self.postprocess.as_mut() {
             pp.settings.ubo.set_tonemap_op(op.as_u32());
         }
+    }
+
+    /// Select the rendering path. `true` = deferred (G-buffer pass +
+    /// deferred lighting pass), `false` = forward. Takes effect on the very
+    /// next `draw_frame` — the two paths record different command buffer
+    /// contents but share the same sync objects.
+    pub fn set_deferred(&mut self, deferred: bool) {
+        self.deferred_enabled = deferred;
+    }
+
+    /// Select the deferred lighting pass's G-buffer visualisation mode.
+    /// Written into the global UBO every frame, so it takes effect on the
+    /// next `draw_frame`. Stored on the renderer so it survives swapchain
+    /// recreation.
+    pub fn set_debug_view(&mut self, view: DeferredDebugView) {
+        self.debug_view = view;
     }
 
     fn name_debug_objects(&self, ctx: &VulkanContext) {
@@ -654,12 +699,17 @@ impl Renderer {
         let mut globals = GlobalUniforms {
             view: view,
             proj: proj,
+            // The deferred lighting pass reconstructs world positions from
+            // the depth buffer with this matrix.
+            inv_view_proj: (proj * view).inverse(),
             camera_pos: glam::Vec4::new(camera_pos.x, camera_pos.y, camera_pos.z, 0.0),
             light_dir: glam::Vec4::new(light_dir.x, light_dir.y, light_dir.z, 0.0),
             lighting_pack: glam::Vec4::ZERO,
+            deferred_pack: glam::Vec4::ZERO,
         };
         globals.set_light_intensity(4.0);
         globals.set_prefilter_max_lod(prefilter_max_lod);
+        globals.set_debug_view(self.debug_view.as_u32());
         unsafe {
             std::ptr::copy_nonoverlapping(
                 bytemuck::bytes_of(&globals).as_ptr(),
@@ -670,33 +720,51 @@ impl Renderer {
 
         let extent = self.swapchain.extent;
         let postprocess = self.postprocess.as_ref().expect("postprocess must exist");
-        let scene_framebuffer = postprocess.scene_framebuffers[image_index as usize];
         let composite_framebuffer = self.swapchain.framebuffers[image_index as usize];
 
         // Update postprocess UBO for this frame.
         postprocess.update_ubo(frame);
 
-        record_command_buffer(
-            &ctx.device,
-            &ctx.debug_marker,
-            command_buffer,
-            frame,
-            image_index,
-            scene_framebuffer,
-            composite_framebuffer,
-            extent,
-            postprocess,
-            self.pipeline.pipeline,
-            self.pipeline.pipeline_layout,
-            self.skybox_pipeline.pipeline,
-            self.skybox_pipeline.pipeline_layout,
-            self.global_descriptor_sets[frame],
-            &self.material_descriptor_sets,
-            &self.scene,
-            self.skybox_vertex_buffer.buffer,
-            self.skybox_index_buffer.buffer,
-            self.skybox_index_count,
-        );
+        if self.deferred_enabled {
+            let gbuffer = self.gbuffer.as_ref().expect("gbuffer must exist");
+            record_deferred_command_buffer(
+                &ctx.device,
+                &ctx.debug_marker,
+                command_buffer,
+                frame,
+                image_index,
+                extent,
+                gbuffer,
+                postprocess,
+                composite_framebuffer,
+                self.global_descriptor_sets[frame],
+                &self.material_descriptor_sets,
+                &self.scene,
+            );
+        } else {
+            let scene_framebuffer = postprocess.scene_framebuffers[image_index as usize];
+            record_command_buffer(
+                &ctx.device,
+                &ctx.debug_marker,
+                command_buffer,
+                frame,
+                image_index,
+                scene_framebuffer,
+                composite_framebuffer,
+                extent,
+                postprocess,
+                self.pipeline.pipeline,
+                self.pipeline.pipeline_layout,
+                self.skybox_pipeline.pipeline,
+                self.skybox_pipeline.pipeline_layout,
+                self.global_descriptor_sets[frame],
+                &self.material_descriptor_sets,
+                &self.scene,
+                self.skybox_vertex_buffer.buffer,
+                self.skybox_index_buffer.buffer,
+                self.skybox_index_count,
+            );
+        }
 
         let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
         let submit_info = vk::SubmitInfo::default()
@@ -805,6 +873,12 @@ impl Renderer {
         // and the descriptor sets that point at them. The UBO sets, pipeline
         // layouts, render passes, and pipeline objects are reused.
         let depth_format = self.swapchain.depth_format;
+        // Take the old G-buffer out first: its lighting framebuffers
+        // reference the postprocess scene-color image views, so it must be
+        // destroyed before them.
+        if let Some(mut old) = self.gbuffer.take() {
+            unsafe { old.destroy(&self.device, &mut ctx.allocator); }
+        }
         // Take the old postprocess out so we can destroy it explicitly.
         let old_pp = self.postprocess.take();
         if let Some(mut old) = old_pp {
@@ -821,6 +895,22 @@ impl Renderer {
             MAX_FRAMES_IN_FLIGHT,
             self.composite_render_pass,
         ));
+
+        // Rebuild the deferred path: the G-buffer images are sized to the new
+        // extent and the lighting framebuffers point at the new scene-color
+        // views and the new depth image.
+        {
+            let pp = self.postprocess.as_ref().expect("postprocess must exist");
+            self.gbuffer = Some(GBufferResources::new(
+                ctx,
+                depth_format,
+                swapchain.depth_view,
+                swapchain.extent,
+                &pp.scene_views,
+                self.global_descriptor_set_layout,
+                self.material_descriptor_set_layout,
+            ));
+        }
 
         self.swapchain = swapchain;
 
@@ -840,6 +930,12 @@ impl Renderer {
                         semaphore,
                         &format!("Render Finished Semaphore Swapchain Image {}", i),
                     );
+                }
+                if let Some(ref gb) = self.gbuffer {
+                    gb.name_debug_objects(dm);
+                }
+                if let Some(ref pp) = self.postprocess {
+                    pp.name_debug_objects(dm);
                 }
             }
         }
@@ -957,6 +1053,12 @@ impl Renderer {
         // created against is owned by PostProcessResources and is
         // destroyed by `pp.destroy()` below.
 
+        // Destroy the deferred path first: its lighting framebuffers
+        // reference the postprocess scene-color image views.
+        if let Some(mut gb) = self.gbuffer.take() {
+            gb.destroy(&self.device, allocator);
+        }
+
         // Destroy the postprocess resources (descriptor pool, pipelines,
         // scene color images, bloom pyramid, framebuffers, render passes).
         // They must be destroyed before the device is destroyed, but the
@@ -999,36 +1101,9 @@ fn record_command_buffer(
     skybox_index_buffer: vk::Buffer,
     skybox_index_count: u32,
 ) {
-    let begin_info = vk::CommandBufferBeginInfo::default();
     unsafe {
-        device
-            .begin_command_buffer(command_buffer, &begin_info)
-            .unwrap();
-        { let dm = debug_marker;
-            dm.begin_label(
-                command_buffer,
-                &format!("Frame {} / Swapchain Image {}", frame, image_index),
-                FRAME_LABEL_COLOR,
-            );
-        }
+        begin_frame_command_buffer(device, debug_marker, command_buffer, frame, image_index);
     }
-
-    // The negative-height viewport is used for every render pass. This is
-    // required by the project's winding contract (see
-    // docs/winding_orientation.md) for the PBR and skybox pipelines, and is
-    // also fine for the postprocess fullscreen-triangle passes (whose
-    // pipelines use cull_mode = NONE).
-    let viewport = vk::Viewport::default()
-        .x(0.0)
-        .y(extent.height as f32)
-        .width(extent.width as f32)
-        .height(-(extent.height as f32))
-        .min_depth(0.0)
-        .max_depth(1.0);
-
-    let scissor = vk::Rect2D::default()
-        .offset(vk::Offset2D { x: 0, y: 0 })
-        .extent(extent);
 
     let scene_clear_values = [
         vk::ClearValue {
@@ -1062,15 +1137,7 @@ fn record_command_buffer(
             &scene_pass_begin,
             vk::SubpassContents::INLINE,
         );
-        { let dm = debug_marker;
-            dm.insert_label(
-                command_buffer,
-                "Set Dynamic Viewport/Scissor",
-                SETUP_LABEL_COLOR,
-            );
-        }
-        device.cmd_set_viewport(command_buffer, 0, std::slice::from_ref(&viewport));
-        device.cmd_set_scissor(command_buffer, 0, std::slice::from_ref(&scissor));
+        set_frame_viewport_and_scissor(device, debug_marker, command_buffer, extent);
 
         // ---- Draw skybox first ----
         { let dm = debug_marker;
@@ -1128,81 +1195,14 @@ fn record_command_buffer(
             &[],
         );
 
-        for (mesh_index, mesh) in scene.meshes.iter().enumerate() {
-            { let dm = debug_marker;
-                dm.begin_label(
-                    command_buffer,
-                    &format!(
-                        "Draw Mesh {} | Material {} | {} indices",
-                        mesh_index, mesh.material_index, mesh.index_count
-                    ),
-                    DRAW_LABEL_COLOR,
-                );
-            }
-
-            let mut pc = PushConstants {
-                model: mesh.world_matrix,
-                tail: glam::Vec4::ZERO,
-            };
-            pc.set_material_index(mesh.material_index as u32);
-            let pc_bytes = bytemuck::bytes_of(&pc);
-
-            { let dm = debug_marker;
-                dm.insert_label(
-                    command_buffer,
-                    "Push Constants: model matrix + material index",
-                    SETUP_LABEL_COLOR,
-                );
-            }
-            device.cmd_push_constants(
-                command_buffer,
-                pbr_pipeline_layout,
-                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                0,
-                pc_bytes,
-            );
-
-            { let dm = debug_marker;
-                dm.insert_label(
-                    command_buffer,
-                    "Bind Material Descriptor Set",
-                    SETUP_LABEL_COLOR,
-                );
-            }
-            device.cmd_bind_descriptor_sets(
-                command_buffer,
-                vk::PipelineBindPoint::GRAPHICS,
-                pbr_pipeline_layout,
-                1,
-                std::slice::from_ref(&material_descriptor_sets[mesh.material_index]),
-                &[],
-            );
-
-            { let dm = debug_marker;
-                dm.insert_label(
-                    command_buffer,
-                    "Bind Vertex/Index Buffers",
-                    SETUP_LABEL_COLOR,
-                );
-            }
-            device.cmd_bind_vertex_buffers(
-                command_buffer,
-                0,
-                std::slice::from_ref(&mesh.vertex_buffer.buffer),
-                &[0],
-            );
-            device.cmd_bind_index_buffer(
-                command_buffer,
-                mesh.index_buffer.buffer,
-                0,
-                vk::IndexType::UINT32,
-            );
-            device.cmd_draw_indexed(command_buffer, mesh.index_count, 1, 0, 0, 0);
-
-            { let dm = debug_marker;
-                dm.end_label(command_buffer);
-            }
-        }
+        record_geometry_draws(
+            device,
+            debug_marker,
+            command_buffer,
+            pbr_pipeline_layout,
+            material_descriptor_sets,
+            scene,
+        );
 
         device.cmd_end_render_pass(command_buffer);
         { let dm = debug_marker;
@@ -1215,74 +1215,19 @@ fn record_command_buffer(
     // at the end of the scene render pass (because the scene render pass
     // declared that final_layout), so we can sample it directly.
     unsafe {
-        { let dm = debug_marker;
-            dm.begin_label(command_buffer, "PostProcessing", POSTPROCESS_LABEL_COLOR);
-        }
-
-        // Bloom Prefilter: extract highlights (soft-threshold) from scene color
-        // and write to bloom mip 0.
-        { let dm = debug_marker;
-            dm.begin_label(command_buffer, "Bloom Prefilter", RENDER_PASS_LABEL_COLOR);
-        }
-        record_bright_pass(
-            device,
-            debug_marker,
-            command_buffer,
-            postprocess,
-            image_index as usize,
-            frame,           // bloom_index
-            frame,
-            extent,
-        );
-        { let dm = debug_marker;
-            dm.end_label(command_buffer);
-        }
-
-        // Blur passes: per mip, horizontal then vertical (ping-pong).
-        { let dm = debug_marker;
-            dm.begin_label(command_buffer, "Bloom Pyramid", RENDER_PASS_LABEL_COLOR);
-        }
-        record_blur_passes(
-            device,
-            debug_marker,
-            command_buffer,
-            postprocess,
-            frame,           // bloom_index
-            frame,
-            extent,
-        );
-        { let dm = debug_marker;
-            dm.end_label(command_buffer);
-        }
-
-        // Composite: scene + 8 bloom mips + exposure + tonemap -> swapchain.
-        { let dm = debug_marker;
-            dm.begin_label(command_buffer, "Composite Pass", RENDER_PASS_LABEL_COLOR);
-        }
-        record_composite_pass(
+        record_postprocess_passes(
             device,
             debug_marker,
             command_buffer,
             postprocess,
             image_index as usize,
             frame,
+            frame, // bloom_index — the bloom pyramid is per frame-in-flight
             composite_framebuffer,
             extent,
         );
-        { let dm = debug_marker;
-            dm.end_label(command_buffer);
-        }
 
-        { let dm = debug_marker;
-            dm.end_label(command_buffer);
-        }
-    }
-
-    { let dm = debug_marker;
-        unsafe { dm.end_label(command_buffer); }
-    }
-    unsafe {
-        device.end_command_buffer(command_buffer).unwrap();
+        end_frame_command_buffer(device, debug_marker, command_buffer);
     }
 }
 
@@ -1521,5 +1466,401 @@ unsafe fn record_composite_pass(
         );
         device.cmd_draw(command_buffer, 3, 1, 0, 0);
         device.cmd_end_render_pass(command_buffer);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared command-recording helpers
+//
+// The forward and the deferred path differ only in how the scene color is
+// produced; the geometry draw loop and the whole postprocess chain are
+// identical, so they live here.
+// ---------------------------------------------------------------------------
+
+/// Begin a frame command buffer and open its RenderDoc label.
+unsafe fn begin_frame_command_buffer(
+    device: &ash::Device,
+    debug_marker: &DebugMarker,
+    command_buffer: vk::CommandBuffer,
+    frame: usize,
+    image_index: u32,
+) {
+    let begin_info = vk::CommandBufferBeginInfo::default();
+    unsafe {
+        device
+            .begin_command_buffer(command_buffer, &begin_info)
+            .unwrap();
+        debug_marker.begin_label(
+            command_buffer,
+            &format!("Frame {} / Swapchain Image {}", frame, image_index),
+            FRAME_LABEL_COLOR,
+        );
+    }
+}
+
+/// Close the frame label and end the command buffer.
+unsafe fn end_frame_command_buffer(
+    device: &ash::Device,
+    debug_marker: &DebugMarker,
+    command_buffer: vk::CommandBuffer,
+) {
+    unsafe {
+        debug_marker.end_label(command_buffer);
+        device.end_command_buffer(command_buffer).unwrap();
+    }
+}
+
+/// Set the project's standard Y-flip viewport + scissor for a
+/// full-resolution render pass.
+///
+/// The negative height is required by the project's winding contract (see
+/// `docs/winding_orientation.md`) for the geometry pipelines, and is also
+/// fine for the fullscreen-triangle passes (whose pipelines use
+/// `cull_mode = NONE`).
+unsafe fn set_frame_viewport_and_scissor(
+    device: &ash::Device,
+    debug_marker: &DebugMarker,
+    command_buffer: vk::CommandBuffer,
+    extent: vk::Extent2D,
+) {
+    unsafe {
+        debug_marker.insert_label(
+            command_buffer,
+            "Set Dynamic Viewport/Scissor",
+            SETUP_LABEL_COLOR,
+        );
+        let viewport = vk::Viewport::default()
+            .x(0.0)
+            .y(extent.height as f32)
+            .width(extent.width as f32)
+            .height(-(extent.height as f32))
+            .min_depth(0.0)
+            .max_depth(1.0);
+        let scissor = vk::Rect2D::default()
+            .offset(vk::Offset2D { x: 0, y: 0 })
+            .extent(extent);
+        device.cmd_set_viewport(command_buffer, 0, std::slice::from_ref(&viewport));
+        device.cmd_set_scissor(command_buffer, 0, std::slice::from_ref(&scissor));
+    }
+}
+
+/// Draw every mesh of the scene into the render pass that is currently open.
+///
+/// The pipeline and the global descriptor set (set 0) must already be bound
+/// by the caller — that is the only thing that differs between the forward
+/// PBR pipeline and the deferred G-buffer pipeline. Both use the same
+/// per-mesh data: push constants (model matrix + material index), the
+/// material descriptor set (set 1) and the vertex/index buffers.
+unsafe fn record_geometry_draws(
+    device: &ash::Device,
+    debug_marker: &DebugMarker,
+    command_buffer: vk::CommandBuffer,
+    pipeline_layout: vk::PipelineLayout,
+    material_descriptor_sets: &[vk::DescriptorSet],
+    scene: &Scene,
+) {
+    for (mesh_index, mesh) in scene.meshes.iter().enumerate() {
+        unsafe {
+            debug_marker.begin_label(
+                command_buffer,
+                &format!(
+                    "Draw Mesh {} | Material {} | {} indices",
+                    mesh_index, mesh.material_index, mesh.index_count
+                ),
+                DRAW_LABEL_COLOR,
+            );
+        }
+
+        let mut pc = PushConstants {
+            model: mesh.world_matrix,
+            tail: glam::Vec4::ZERO,
+        };
+        pc.set_material_index(mesh.material_index as u32);
+        let pc_bytes = bytemuck::bytes_of(&pc);
+
+        unsafe {
+            debug_marker.insert_label(
+                command_buffer,
+                "Push Constants: model matrix + material index",
+                SETUP_LABEL_COLOR,
+            );
+            device.cmd_push_constants(
+                command_buffer,
+                pipeline_layout,
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                0,
+                pc_bytes,
+            );
+
+            debug_marker.insert_label(
+                command_buffer,
+                "Bind Material Descriptor Set",
+                SETUP_LABEL_COLOR,
+            );
+            device.cmd_bind_descriptor_sets(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipeline_layout,
+                1,
+                std::slice::from_ref(&material_descriptor_sets[mesh.material_index]),
+                &[],
+            );
+
+            debug_marker.insert_label(
+                command_buffer,
+                "Bind Vertex/Index Buffers",
+                SETUP_LABEL_COLOR,
+            );
+            device.cmd_bind_vertex_buffers(
+                command_buffer,
+                0,
+                std::slice::from_ref(&mesh.vertex_buffer.buffer),
+                &[0],
+            );
+            device.cmd_bind_index_buffer(
+                command_buffer,
+                mesh.index_buffer.buffer,
+                0,
+                vk::IndexType::UINT32,
+            );
+            device.cmd_draw_indexed(command_buffer, mesh.index_count, 1, 0, 0, 0);
+
+            debug_marker.end_label(command_buffer);
+        }
+    }
+}
+
+/// The bloom + composite chain, shared verbatim by the forward and the
+/// deferred path: both leave the lit HDR result in the postprocess
+/// scene-color image, already transitioned to `SHADER_READ_ONLY_OPTIMAL` by
+/// whichever render pass produced it.
+unsafe fn record_postprocess_passes(
+    device: &ash::Device,
+    debug_marker: &DebugMarker,
+    command_buffer: vk::CommandBuffer,
+    postprocess: &PostProcessResources,
+    image_index: usize,
+    frame: usize,
+    bloom_index: usize,
+    composite_framebuffer: vk::Framebuffer,
+    extent: vk::Extent2D,
+) {
+    unsafe {
+        debug_marker.begin_label(command_buffer, "PostProcessing", POSTPROCESS_LABEL_COLOR);
+
+        // Bloom Prefilter: extract highlights (soft-threshold) from scene color
+        // and write to bloom mip 0.
+        debug_marker.begin_label(command_buffer, "Bloom Prefilter", RENDER_PASS_LABEL_COLOR);
+        record_bright_pass(
+            device,
+            debug_marker,
+            command_buffer,
+            postprocess,
+            image_index,
+            bloom_index,
+            frame,
+            extent,
+        );
+        debug_marker.end_label(command_buffer);
+
+        // Blur passes: per mip, horizontal then vertical (ping-pong).
+        debug_marker.begin_label(command_buffer, "Bloom Pyramid", RENDER_PASS_LABEL_COLOR);
+        record_blur_passes(
+            device,
+            debug_marker,
+            command_buffer,
+            postprocess,
+            bloom_index,
+            frame,
+            extent,
+        );
+        debug_marker.end_label(command_buffer);
+
+        // Composite: scene + 8 bloom mips + exposure + tonemap -> swapchain.
+        debug_marker.begin_label(command_buffer, "Composite Pass", RENDER_PASS_LABEL_COLOR);
+        record_composite_pass(
+            device,
+            debug_marker,
+            command_buffer,
+            postprocess,
+            image_index,
+            frame,
+            composite_framebuffer,
+            extent,
+        );
+        debug_marker.end_label(command_buffer);
+
+        debug_marker.end_label(command_buffer);
+    }
+}
+
+/// Record the **deferred** frame:
+///
+/// 1. G-buffer pass — `gbuffer.frag` fills albedo + AO, world normal +
+///    roughness and emissive + metallic, and writes depth.
+/// 2. Deferred lighting pass — one fullscreen triangle (`deferred.frag`)
+///    reconstructs the world position of each pixel from the depth buffer,
+///    shades it, and fills the background from the environment cubemap.
+///    Writes the same HDR scene-color image the forward path writes.
+/// 3. The shared bloom + composite chain.
+fn record_deferred_command_buffer(
+    device: &ash::Device,
+    debug_marker: &DebugMarker,
+    command_buffer: vk::CommandBuffer,
+    frame: usize,
+    image_index: u32,
+    extent: vk::Extent2D,
+    gbuffer: &GBufferResources,
+    postprocess: &PostProcessResources,
+    composite_framebuffer: vk::Framebuffer,
+    global_descriptor_set: vk::DescriptorSet,
+    material_descriptor_sets: &[vk::DescriptorSet],
+    scene: &Scene,
+) {
+    unsafe {
+        begin_frame_command_buffer(device, debug_marker, command_buffer, frame, image_index);
+    }
+
+    let render_area = vk::Rect2D {
+        offset: vk::Offset2D { x: 0, y: 0 },
+        extent,
+    };
+
+    // ---- G-buffer pass ----
+    let gbuffer_pipeline = gbuffer.gbuffer_pipeline.as_ref().unwrap();
+    let gbuffer_clear_values = [
+        vk::ClearValue {
+            color: vk::ClearColorValue {
+                float32: [0.0, 0.0, 0.0, 1.0],
+            },
+        },
+        vk::ClearValue {
+            color: vk::ClearColorValue {
+                float32: [0.0, 0.0, 0.0, 1.0],
+            },
+        },
+        vk::ClearValue {
+            color: vk::ClearColorValue {
+                float32: [0.0, 0.0, 0.0, 1.0],
+            },
+        },
+        vk::ClearValue {
+            depth_stencil: vk::ClearDepthStencilValue {
+                depth: 1.0,
+                stencil: 0,
+            },
+        },
+    ];
+    let gbuffer_pass_begin = vk::RenderPassBeginInfo::default()
+        .render_pass(gbuffer.gbuffer_render_pass)
+        .framebuffer(gbuffer.framebuffers[image_index as usize])
+        .render_area(render_area)
+        .clear_values(&gbuffer_clear_values);
+
+    unsafe {
+        debug_marker.begin_label(command_buffer, "G-Buffer Pass", RENDER_PASS_LABEL_COLOR);
+        device.cmd_begin_render_pass(
+            command_buffer,
+            &gbuffer_pass_begin,
+            vk::SubpassContents::INLINE,
+        );
+        set_frame_viewport_and_scissor(device, debug_marker, command_buffer, extent);
+
+        debug_marker.insert_label(command_buffer, "Bind G-Buffer Pipeline", SETUP_LABEL_COLOR);
+        device.cmd_bind_pipeline(
+            command_buffer,
+            vk::PipelineBindPoint::GRAPHICS,
+            gbuffer_pipeline.pipeline,
+        );
+
+        debug_marker.insert_label(command_buffer, "Bind Global Descriptors", SETUP_LABEL_COLOR);
+        device.cmd_bind_descriptor_sets(
+            command_buffer,
+            vk::PipelineBindPoint::GRAPHICS,
+            gbuffer_pipeline.pipeline_layout,
+            0,
+            std::slice::from_ref(&global_descriptor_set),
+            &[],
+        );
+
+        record_geometry_draws(
+            device,
+            debug_marker,
+            command_buffer,
+            gbuffer_pipeline.pipeline_layout,
+            material_descriptor_sets,
+            scene,
+        );
+
+        device.cmd_end_render_pass(command_buffer);
+        debug_marker.end_label(command_buffer);
+    }
+
+    // ---- Deferred lighting pass ----
+    let lighting_pipeline = gbuffer.lighting_pipeline.as_ref().unwrap();
+    let lighting_clear_values = [vk::ClearValue {
+        color: vk::ClearColorValue {
+            float32: [0.0, 0.0, 0.0, 1.0],
+        },
+    }];
+    let lighting_pass_begin = vk::RenderPassBeginInfo::default()
+        .render_pass(gbuffer.lighting_render_pass)
+        .framebuffer(gbuffer.lighting_framebuffers[image_index as usize])
+        .render_area(render_area)
+        .clear_values(&lighting_clear_values);
+
+    unsafe {
+        debug_marker.begin_label(
+            command_buffer,
+            "Deferred Lighting Pass",
+            RENDER_PASS_LABEL_COLOR,
+        );
+        device.cmd_begin_render_pass(
+            command_buffer,
+            &lighting_pass_begin,
+            vk::SubpassContents::INLINE,
+        );
+        set_viewport_and_bind_pipeline(
+            device,
+            command_buffer,
+            extent,
+            lighting_pipeline.pipeline,
+        );
+        // set 0 = global UBO + IBL (the renderer's existing global set),
+        // set 1 = the G-buffer inputs for this swapchain image.
+        let sets: [vk::DescriptorSet; 2] = [
+            global_descriptor_set,
+            gbuffer.input_sets[image_index as usize],
+        ];
+        device.cmd_bind_descriptor_sets(
+            command_buffer,
+            vk::PipelineBindPoint::GRAPHICS,
+            lighting_pipeline.pipeline_layout,
+            0,
+            &sets,
+            &[],
+        );
+        device.cmd_draw(command_buffer, 3, 1, 0, 0);
+        device.cmd_end_render_pass(command_buffer);
+        debug_marker.end_label(command_buffer);
+    }
+
+    // ---- Postprocess passes ----
+    // The lighting render pass leaves the scene-color image in
+    // SHADER_READ_ONLY_OPTIMAL, so bloom can sample it directly.
+    unsafe {
+        record_postprocess_passes(
+            device,
+            debug_marker,
+            command_buffer,
+            postprocess,
+            image_index as usize,
+            frame,
+            frame, // bloom_index — the bloom pyramid is per frame-in-flight
+            composite_framebuffer,
+            extent,
+        );
+
+        end_frame_command_buffer(device, debug_marker, command_buffer);
     }
 }

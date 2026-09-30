@@ -3,6 +3,7 @@ pub mod buffer;
 pub mod context;
 pub mod cubemap;
 pub mod debug_marker;
+pub mod deferred;
 pub mod descriptors;
 pub mod ibl;
 pub mod ktx2_loader;
